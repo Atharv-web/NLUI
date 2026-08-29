@@ -1,0 +1,93 @@
+# Python bytecode and interpreter caches
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Native extensions
+*.so
+*.pyd
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Environment variables and local secrets
+.env
+.env.*
+!.env.example
+!.env.template
+config/api_keys.json
+!config/api_keys.example.json
+config/certs/
+*.key
+*.pem
+*.p12
+*.pfx
+
+# Application runtime data
+logs/
+*.log
+memory/long_term.json
+!memory/long_term.example.json
+*.pid
+*.pid.lock
+*.sqlite
+*.sqlite3
+*.db
+
+# Packaging and build output
+build/
+dist/
+downloads/
+*.egg-info/
+.eggs/
+eggs/
+wheels/
+pip-wheel-metadata/
+MANIFEST
+
+# Test, coverage, and analysis caches
+.pytest_cache/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+.tox/
+.nox/
+.hypothesis/
+.mypy_cache/
+.pyright/
+.ruff_cache/
+
+# Playwright and browser-test artifacts
+test-results/
+playwright-report/
+blob-report/
+playwright/.cache/
+
+# Notebook checkpoints
+.ipynb_checkpoints/
+
+# IDE and editor settings
+.idea/
+.vscode/
+*.code-workspace
+*.swp
+*.swo
+*~
+
+# Operating-system files
+.DS_Store
+._*
+Thumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# Temporary files
+*.tmp
+*.temp
+*.bak
+*.orig
+~$*
