@@ -1808,6 +1808,7 @@ class MainWindow(QMainWindow):
         # Load customization from config
         _cfg = _read_full_config()
         self._assistant_name: str = (_cfg.get("assistant_name") or "JARVIS").strip()
+        self._barge_in_enabled = bool(_cfg.get("barge_in_enabled", False))
         _display = self._assistant_name.upper()
 
         # Kayıtlı UI rengini panel/stylesheet'ler kurulmadan ÖNCE uygula
@@ -1828,6 +1829,7 @@ class MainWindow(QMainWindow):
         self.on_text_command   = None
         self.on_remote_clicked = None   # callable: () -> (url, key) | None
         self.on_interrupt      = None   # callable: () -> None — stop JARVIS mid-speech
+        self.on_barge_in_changed = None # callable: (enabled: bool) -> None
         self.on_open_debug_logs = None  # callable: keyword filters -> redacted event list
         self._muted            = False
         self._current_file: str | None = None
@@ -1920,6 +1922,7 @@ class MainWindow(QMainWindow):
         # Quick-access drawer (floating overlay, built after central widget layout is done)
         self._quick_drawer = self._build_quick_drawer()
         self._update_autostart_btn(self._check_autostart())
+        self._update_barge_in_btn(self._barge_in_enabled)
         from memory.config_manager import get_brief_enabled as _gbe
         self._update_brief_btn(_gbe())
 
@@ -2738,6 +2741,13 @@ class MainWindow(QMainWindow):
         remote_btn.clicked.connect(self._open_remote)
         lay.addWidget(remote_btn)
 
+        self._barge_in_btn = QPushButton()
+        self._barge_in_btn.setFixedHeight(26)
+        self._barge_in_btn.setFont(QFont("Courier New", 7))
+        self._barge_in_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._barge_in_btn.clicked.connect(self._toggle_barge_in)
+        lay.addWidget(self._barge_in_btn)
+
         fs_btn = QPushButton("⛶  FULLSCREEN  [F11]")
         fs_btn.setFixedHeight(26)
         fs_btn.setFont(QFont("Courier New", 7))
@@ -3118,6 +3128,49 @@ class MainWindow(QMainWindow):
         save_brief_enabled(new_val)
         self._update_brief_btn(new_val)
 
+    def _toggle_barge_in(self):
+        self._barge_in_enabled = not self._barge_in_enabled
+        try:
+            data = _read_full_config()
+            data["barge_in_enabled"] = self._barge_in_enabled
+            API_FILE.write_text(json.dumps(data, indent=4), encoding="utf-8")
+        except Exception as exc:
+            self._barge_in_enabled = not self._barge_in_enabled
+            self._log.append_log(f"ERR: Barge-in setting failed — {exc}")
+            return
+        self._update_barge_in_btn(self._barge_in_enabled)
+        if self.on_barge_in_changed:
+            self.on_barge_in_changed(self._barge_in_enabled)
+        self._log.append_log(
+            "SYS: Voice interruption "
+            f"{'enabled' if self._barge_in_enabled else 'disabled'}."
+        )
+
+    def _update_barge_in_btn(self, enabled: bool):
+        if not hasattr(self, "_barge_in_btn"):
+            return
+        self._barge_in_btn.setText(
+            f"VOICE INTERRUPT: {'ON' if enabled else 'OFF'}"
+        )
+        if enabled:
+            self._barge_in_btn.setStyleSheet(f"""
+                QPushButton {{
+                    background: #001a08; color: {C.GREEN};
+                    border: 1px solid {C.GREEN_D}; border-radius: 3px;
+                    text-align: left; padding: 0 8px;
+                }}
+                QPushButton:hover {{ background: #002010; }}
+            """)
+        else:
+            self._barge_in_btn.setStyleSheet(f"""
+                QPushButton {{
+                    background: transparent; color: {C.TEXT_DIM};
+                    border: 1px solid {C.BORDER}; border-radius: 3px;
+                    text-align: left; padding: 0 8px;
+                }}
+                QPushButton:hover {{ color: {C.TEXT}; border-color: {C.BORDER_B}; }}
+            """)
+
     def _update_brief_btn(self, enabled: bool):
         if not hasattr(self, '_brief_btn'):
             return
@@ -3370,6 +3423,14 @@ class JarvisUI:
     @on_interrupt.setter
     def on_interrupt(self, cb):
         self._win.on_interrupt = cb
+
+    @property
+    def on_barge_in_changed(self):
+        return self._win.on_barge_in_changed
+
+    @on_barge_in_changed.setter
+    def on_barge_in_changed(self, cb):
+        self._win.on_barge_in_changed = cb
 
     @property
     def on_open_debug_logs(self):
