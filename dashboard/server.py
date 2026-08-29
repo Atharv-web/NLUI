@@ -380,7 +380,9 @@ class DashboardServer:
         self._connect_callback            = None
         self._pending_keys: dict[str, float] = {}
         self._device_sessions: dict[str, dict] = {}  # device_token → {session_key}
-        self._phone_audio_queue: asyncio.Queue    = asyncio.Queue(maxsize=200)
+        # Keep at most one second of 40 ms PCM frames. Realtime speech should
+        # drop stale audio instead of making the conversation increasingly late.
+        self._phone_audio_queue: asyncio.Queue    = asyncio.Queue(maxsize=25)
         self._uploads_dir                 = UPLOADS_DIR
         self._login_html                  = _read("login.html")
         self._app_html                    = _read("app.html")
@@ -619,12 +621,17 @@ class DashboardServer:
             try:
                 while True:
                     data = await websocket.receive_bytes()
+                    if self._phone_audio_queue.full():
+                        try:
+                            self._phone_audio_queue.get_nowait()
+                        except asyncio.QueueEmpty:
+                            pass
                     try:
                         self._phone_audio_queue.put_nowait(
-                            {"data": data, "mime_type": "audio/pcm"}
+                            {"data": data, "mime_type": "audio/pcm;rate=16000"}
                         )
                     except asyncio.QueueFull:
-                        pass  # drop frame rather than block
+                        pass
             except WebSocketDisconnect:
                 pass
             finally:

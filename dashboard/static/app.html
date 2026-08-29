@@ -425,8 +425,15 @@
         const ratio = srcRate / 16000;
         const len   = Math.round(f32.length / ratio);
         s = new Float32Array(len);
-        for (let i = 0; i < len; i++)
-          s[i] = f32[Math.min(Math.round(i * ratio), f32.length - 1)];
+        // Linear interpolation avoids the aliasing produced by nearest-neighbour
+        // sampling and materially improves consonants before speech recognition.
+        for (let i = 0; i < len; i++) {
+          const pos = i * ratio;
+          const lo  = Math.floor(pos);
+          const hi  = Math.min(lo + 1, f32.length - 1);
+          const mix = pos - lo;
+          s[i] = f32[lo] + (f32[hi] - f32[lo]) * mix;
+        }
       }
       const out = new Int16Array(s.length);
       for (let i = 0; i < s.length; i++)
@@ -472,7 +479,12 @@
       let stream;
       try {
         stream = await navigator.mediaDevices.getUserMedia({
-          audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true },
+          audio: {
+            channelCount: 1,
+            echoCancellation: true,
+            noiseSuppression: true,
+            autoGainControl: true,
+          },
         });
       } catch (e) {
         sys(e.name === 'NotAllowedError'
@@ -504,13 +516,12 @@
           await ctx.audioWorklet.addModule(burl);
           URL.revokeObjectURL(burl);
           const nd = new AudioWorkletNode(ctx, 'j');
-          // Buffer to 1024 samples (64 ms at 16 kHz) before sending —
-          // matches PC mic chunk size, prevents queue flooding on the server.
+          // Buffer to 640 samples (40 ms at 16 kHz) for low conversational latency.
           let _pbuf = [], _plen = 0;
           nd.port.onmessage = e => {
             const chunk = new Int16Array(_f32toPcm16(e.data, rate));
             _pbuf.push(chunk); _plen += chunk.length;
-            if (_plen >= 1024) {
+            if (_plen >= 640) {
               const out = new Int16Array(_plen); let off = 0;
               for (const c of _pbuf) { out.set(c, off); off += c.length; }
               if (ws.readyState === 1) ws.send(out.buffer);
@@ -521,7 +532,7 @@
           _audioNd = nd;
         } catch (_) {
           // ScriptProcessor fallback (deprecated, still works everywhere)
-          const sp = ctx.createScriptProcessor(4096, 1, 1);
+          const sp = ctx.createScriptProcessor(2048, 1, 1);
           sp.onaudioprocess = e => {
             if (ws.readyState === 1) ws.send(_f32toPcm16(e.inputBuffer.getChannelData(0), rate));
           };
