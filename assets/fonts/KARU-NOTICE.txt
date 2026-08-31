@@ -1,0 +1,9 @@
+Karu Light Demo
+Designer / foundry: Emil Karl Bertell / Fenotype
+
+This file is the freely available demo cut used for local development and
+visual evaluation. It is not treated as a production redistribution license.
+Replace it with a properly licensed Karu family file before distributing the
+application.
+
+Official family page: https://www.fenotype.com/font/karu
