@@ -29,6 +29,25 @@ from google import genai
 from google.genai import types
 from ui import JarvisUI
 from core.logging_service import JarvisLogger
+from orchestrator.model_capabilities import (
+    CapabilityStatus,
+    GoogleModelMetadataProvider,
+    check_model_capabilities,
+)
+from orchestrator.runtime_models import RUNTIME_ORCHESTRATOR_CONFIG, VOICE_MODEL
+from orchestrator.coordination import (
+    CoordinationHealth,
+    CoordinationLifecycle,
+    CoordinationMode,
+    create_application_coordination,
+)
+from orchestrator.safety import (
+    CallableToolAdapter,
+    ExecutionGateway,
+    GatewayDisposition,
+    LegacyToolIntake,
+    ToolAdapterRegistry,
+)
 from core.live_audio import (
     drain_async_queue as _drain_async_queue,
     merge_transcript as _merge_transcript,
@@ -74,7 +93,8 @@ def get_base_dir():
 BASE_DIR        = get_base_dir()
 API_CONFIG_PATH = BASE_DIR / "config" / "api_keys.json"
 PROMPT_PATH     = BASE_DIR / "core" / "prompt.txt"
-LIVE_MODEL          = "gemini-2.5-flash-native-audio-preview-12-2025"
+ORCHESTRATOR_CONFIG = RUNTIME_ORCHESTRATOR_CONFIG
+LIVE_MODEL          = VOICE_MODEL
 CHANNELS            = 1
 SEND_SAMPLE_RATE    = 16000
 RECEIVE_SAMPLE_RATE = 24000
@@ -101,455 +121,7 @@ def _load_system_prompt() -> str:
             "Never simulate or guess results — always call the appropriate tool."
         )
 
-TOOL_DECLARATIONS = [
-    {
-        "name": "open_app",
-        "description": (
-            "Opens any application on the computer. "
-            "Use this whenever the user asks to open, launch, or start any app, "
-            "website, or program. Always call this tool — never just say you opened it."
-        ),
-        "parameters": {
-            "type": "OBJECT",
-            "properties": {
-                "app_name": {
-                    "type": "STRING",
-                    "description": "Exact name of the application (e.g. 'WhatsApp', 'Chrome', 'Spotify')"
-                }
-            },
-            "required": ["app_name"]
-        }
-    },
-    {
-        "name": "web_search",
-        "description": (
-            "Searches the web. Use for ANY question about current facts, events, prices, "
-            "or topics — always prefer this over guessing. "
-            "Modes: 'search' (default), 'news' (latest headlines on a topic), "
-            "'research' (deep comprehensive answer), 'price' (product cost lookup), "
-            "'compare' (side-by-side comparison of items)."
-        ),
-        "parameters": {
-            "type": "OBJECT",
-            "properties": {
-                "query":  {"type": "STRING", "description": "Search query or topic"},
-                "mode":   {"type": "STRING", "description": "search | news | research | price | compare"},
-                "items":  {"type": "ARRAY",  "items": {"type": "STRING"}, "description": "Items to compare (compare mode)"},
-                "aspect": {"type": "STRING", "description": "Comparison aspect: price | specs | reviews | features"},
-            },
-            "required": ["query"]
-        }
-    },
-    {
-        "name": "system_status",
-        "description": (
-            "Returns real-time system metrics: CPU usage, RAM, GPU load, CPU temperature, "
-            "uptime, and process count. Use when the user asks about computer performance, "
-            "temperature, memory, or resource usage."
-        ),
-        "parameters": {
-            "type": "OBJECT",
-            "properties": {},
-        }
-    },
-    {
-        "name": "weather_report",
-        "description": "Gives the weather report to user",
-        "parameters": {
-            "type": "OBJECT",
-            "properties": {
-                "city": {"type": "STRING", "description": "City name"}
-            },
-            "required": ["city"]
-        }
-    },
-    {
-        "name": "send_message",
-        "description": "Sends a text message via WhatsApp, Telegram, or other messaging platform.",
-        "parameters": {
-            "type": "OBJECT",
-            "properties": {
-                "receiver":     {"type": "STRING", "description": "Recipient contact name"},
-                "message_text": {"type": "STRING", "description": "The message to send"},
-                "platform":     {"type": "STRING", "description": "Platform: WhatsApp, Telegram, etc."}
-            },
-            "required": ["receiver", "message_text", "platform"]
-        }
-    },
-    {
-        "name": "reminder",
-        "description": "Sets a timed reminder using Task Scheduler.",
-        "parameters": {
-            "type": "OBJECT",
-            "properties": {
-                "date":    {"type": "STRING", "description": "Date in YYYY-MM-DD format"},
-                "time":    {"type": "STRING", "description": "Time in HH:MM format (24h)"},
-                "message": {"type": "STRING", "description": "Reminder message text"}
-            },
-            "required": ["date", "time", "message"]
-        }
-    },
-    {
-        "name": "youtube_video",
-        "description": (
-            "Controls YouTube. Use for: playing videos, summarizing a video's content, "
-            "getting video info, or showing trending videos."
-        ),
-        "parameters": {
-            "type": "OBJECT",
-            "properties": {
-                "action": {"type": "STRING", "description": "play | summarize | get_info | trending (default: play)"},
-                "query":  {"type": "STRING", "description": "Search query for play action"},
-                "save":   {"type": "BOOLEAN", "description": "Save summary to Notepad (summarize only)"},
-                "region": {"type": "STRING", "description": "Country code for trending e.g. TR, US"},
-                "url":    {"type": "STRING", "description": "Video URL for get_info action"},
-            },
-            "required": []
-        }
-    },
-    {
-        "name": "screen_process",
-        "description": (
-            "Captures the screen or webcam image and lets you analyze it. "
-            "MUST be called when user asks what is on screen, what you see, "
-            "look at camera, analyze my screen, etc. "
-            "You have NO visual ability without this tool. "
-            "After the image is captured it is sent directly to you — describe what you see and answer the user's question. "
-            "When using camera: the live view stays open until user says close it or calls close_camera."
-        ),
-        "parameters": {
-            "type": "OBJECT",
-            "properties": {
-                "angle": {"type": "STRING", "description": "'screen' to capture display, 'camera' for webcam. Default: 'screen'"},
-                "text":  {"type": "STRING", "description": "The question or instruction about the captured image"}
-            },
-            "required": ["text"]
-        }
-    },
-    {
-        "name": "close_camera",
-        "description": (
-            "Closes the live camera view shown on screen. "
-            "Call when user says: close camera, stop camera, turn off camera, "
-            "kamerayı kapat, kapat, creepy, etc."
-        ),
-        "parameters": {"type": "OBJECT", "properties": {}, "required": []}
-    },
-    {
-        "name": "computer_settings",
-        "description": (
-            "Controls the computer: volume, brightness, window management, keyboard shortcuts, "
-            "typing text on screen, closing apps, fullscreen, dark mode, WiFi, restart, shutdown, "
-            "scrolling, tab management, zoom, screenshots, lock screen, refresh/reload page. "
-            "Use for ANY single computer control command."
-        ),
-        "parameters": {
-            "type": "OBJECT",
-            "properties": {
-                "action":      {"type": "STRING", "description": "The action to perform"},
-                "description": {"type": "STRING", "description": "Natural language description of what to do"},
-                "value":       {"type": "STRING", "description": "Optional value: volume level, text to type, etc."}
-            },
-            "required": []
-        }
-    },
-    {
-        "name": "browser_control",
-        "description": (
-            "Controls any web browser. Use for: opening websites, searching the web, "
-            "clicking elements, filling forms, scrolling, screenshots, navigation, any web-based task. "
-            "Simple open/search requests launch the user's own browser normally (their real profile "
-            "and logged-in accounts); interactive actions (click, type, fill_form...) attach an "
-            "automation browser. "
-            "Always pass the 'browser' parameter when the user specifies a browser (e.g. 'open in Edge', "
-            "'use Firefox', 'open Chrome'). Multiple browsers can run simultaneously."
-        ),
-        "parameters": {
-            "type": "OBJECT",
-            "properties": {
-                "action":      {"type": "STRING", "description": "go_to | search | click | type | scroll | fill_form | smart_click | smart_type | get_text | get_url | press | new_tab | close_tab | screenshot | back | forward | reload | switch | list_browsers | close | close_all"},
-                "browser":     {"type": "STRING", "description": "Target browser: chrome | edge | firefox | opera | operagx | brave | vivaldi | safari. Omit to use the currently active browser."},
-                "url":         {"type": "STRING", "description": "URL for go_to / new_tab action"},
-                "query":       {"type": "STRING", "description": "Search query for search action"},
-                "engine":      {"type": "STRING", "description": "Search engine: google | bing | duckduckgo | yandex (default: google)"},
-                "selector":    {"type": "STRING", "description": "CSS selector for click/type"},
-                "text":        {"type": "STRING", "description": "Text to click or type"},
-                "description": {"type": "STRING", "description": "Element description for smart_click/smart_type"},
-                "direction":   {"type": "STRING", "description": "up | down for scroll"},
-                "amount":      {"type": "INTEGER", "description": "Scroll amount in pixels (default: 500)"},
-                "key":         {"type": "STRING", "description": "Key name for press action (e.g. Enter, Escape, F5)"},
-                "path":        {"type": "STRING", "description": "Save path for screenshot"},
-                "incognito":   {"type": "BOOLEAN", "description": "Open in private/incognito mode"},
-                "clear_first": {"type": "BOOLEAN", "description": "Clear field before typing (default: true)"},
-            },
-            "required": ["action"]
-        }
-    },
-    {
-        "name": "file_controller",
-        "description": "Manages files and folders: list, create, delete, move, copy, rename, read, write, find, disk usage.",
-        "parameters": {
-            "type": "OBJECT",
-            "properties": {
-                "action":      {"type": "STRING", "description": "list | create_file | create_folder | delete | move | copy | rename | read | write | find | largest | disk_usage | organize_desktop | info"},
-                "path":        {"type": "STRING", "description": "File/folder path or shortcut: desktop, downloads, documents, home"},
-                "destination": {"type": "STRING", "description": "Destination path for move/copy"},
-                "new_name":    {"type": "STRING", "description": "New name for rename"},
-                "content":     {"type": "STRING", "description": "Content for create_file/write"},
-                "name":        {"type": "STRING", "description": "File name to search for"},
-                "extension":   {"type": "STRING", "description": "File extension to search (e.g. .pdf)"},
-                "count":       {"type": "INTEGER", "description": "Number of results for largest"},
-            },
-            "required": ["action"]
-        }
-    },
-    {
-        "name": "desktop_control",
-        "description": "Controls the desktop: wallpaper, organize, clean, list, stats.",
-        "parameters": {
-            "type": "OBJECT",
-            "properties": {
-                "action": {"type": "STRING", "description": "wallpaper | wallpaper_url | organize | clean | list | stats | task"},
-                "path":   {"type": "STRING", "description": "Image path for wallpaper"},
-                "url":    {"type": "STRING", "description": "Image URL for wallpaper_url"},
-                "mode":   {"type": "STRING", "description": "by_type or by_date for organize"},
-                "task":   {"type": "STRING", "description": "Natural language desktop task"},
-            },
-            "required": ["action"]
-        }
-    },
-    {
-        "name": "code_helper",
-        "description": "Writes, edits, explains, runs, or builds code files.",
-        "parameters": {
-            "type": "OBJECT",
-            "properties": {
-                "action":      {"type": "STRING", "description": "write | edit | explain | run | build | auto (default: auto)"},
-                "description": {"type": "STRING", "description": "What the code should do or what change to make"},
-                "language":    {"type": "STRING", "description": "Programming language (default: python)"},
-                "output_path": {"type": "STRING", "description": "Where to save the file"},
-                "file_path":   {"type": "STRING", "description": "Path to existing file for edit/explain/run/build"},
-                "code":        {"type": "STRING", "description": "Raw code string for explain"},
-                "args":        {"type": "STRING", "description": "CLI arguments for run/build"},
-                "timeout":     {"type": "INTEGER", "description": "Execution timeout in seconds (default: 30)"},
-            },
-            "required": ["action"]
-        }
-    },
-    {
-        "name": "dev_agent",
-        "description": "Builds complete multi-file projects from scratch: plans, writes files, installs deps, opens VSCode, runs and fixes errors.",
-        "parameters": {
-            "type": "OBJECT",
-            "properties": {
-                "description":  {"type": "STRING", "description": "What the project should do"},
-                "language":     {"type": "STRING", "description": "Programming language (default: python)"},
-                "project_name": {"type": "STRING", "description": "Optional project folder name"},
-                "timeout":      {"type": "INTEGER", "description": "Run timeout in seconds (default: 30)"},
-            },
-            "required": ["description"]
-        }
-    },
-    {
-        "name": "computer_control",
-        "description": "Direct computer control: type, click, hotkeys, scroll, move mouse, screenshots, find elements on screen.",
-        "parameters": {
-            "type": "OBJECT",
-            "properties": {
-                "action":      {"type": "STRING", "description": "type | smart_type | click | double_click | right_click | hotkey | press | scroll | move | copy | paste | screenshot | wait | clear_field | focus_window | screen_find | screen_click | random_data | user_data"},
-                "text":        {"type": "STRING", "description": "Text to type or paste"},
-                "x":           {"type": "INTEGER", "description": "X coordinate"},
-                "y":           {"type": "INTEGER", "description": "Y coordinate"},
-                "keys":        {"type": "STRING", "description": "Key combination e.g. 'ctrl+c'"},
-                "key":         {"type": "STRING", "description": "Single key e.g. 'enter'"},
-                "direction":   {"type": "STRING", "description": "up | down | left | right"},
-                "amount":      {"type": "INTEGER", "description": "Scroll amount (default: 3)"},
-                "seconds":     {"type": "NUMBER",  "description": "Seconds to wait"},
-                "title":       {"type": "STRING",  "description": "Window title for focus_window"},
-                "description": {"type": "STRING",  "description": "Element description for screen_find/screen_click"},
-                "type":        {"type": "STRING",  "description": "Data type for random_data"},
-                "field":       {"type": "STRING",  "description": "Field for user_data: name|email|city"},
-                "clear_first": {"type": "BOOLEAN", "description": "Clear field before typing (default: true)"},
-                "path":        {"type": "STRING",  "description": "Save path for screenshot"},
-            },
-            "required": ["action"]
-        }
-    },
-    {
-        "name": "game_updater",
-        "description": (
-            "THE ONLY tool for ANY Steam or Epic Games request. "
-            "Use for: installing, downloading, updating games, listing installed games, "
-            "checking download status, scheduling updates. "
-            "ALWAYS call directly for any Steam/Epic/game request. "
-            "NEVER use browser_control or web_search for Steam/Epic."
-        ),
-        "parameters": {
-            "type": "OBJECT",
-            "properties": {
-                "action":    {"type": "STRING",  "description": "update | install | list | download_status | schedule | cancel_schedule | schedule_status (default: update)"},
-                "platform":  {"type": "STRING",  "description": "steam | epic | both (default: both)"},
-                "game_name": {"type": "STRING",  "description": "Game name (partial match supported)"},
-                "app_id":    {"type": "STRING",  "description": "Steam AppID for install (optional)"},
-                "hour":      {"type": "INTEGER", "description": "Hour for scheduled update 0-23 (default: 3)"},
-                "minute":    {"type": "INTEGER", "description": "Minute for scheduled update 0-59 (default: 0)"},
-                "shutdown_when_done": {"type": "BOOLEAN", "description": "Shut down PC when download finishes"},
-            },
-            "required": []
-        }
-    },
-    {
-        "name": "flight_finder",
-        "description": "Searches Google Flights and speaks the best options.",
-        "parameters": {
-            "type": "OBJECT",
-            "properties": {
-                "origin":      {"type": "STRING",  "description": "Departure city or airport code"},
-                "destination": {"type": "STRING",  "description": "Arrival city or airport code"},
-                "date":        {"type": "STRING",  "description": "Departure date (any format)"},
-                "return_date": {"type": "STRING",  "description": "Return date for round trips"},
-                "passengers":  {"type": "INTEGER", "description": "Number of passengers (default: 1)"},
-                "cabin":       {"type": "STRING",  "description": "economy | premium | business | first"},
-                "save":        {"type": "BOOLEAN", "description": "Save results to Notepad"},
-            },
-            "required": ["origin", "destination", "date"]
-        }
-    },
-    {
-        "name": "manage_monitor",
-        "description": (
-            "Add, remove, or list background monitoring topics. "
-            "JARVIS checks these topics once a day and alerts the user when there is a new development. "
-            "Use 'add' when the user says 'monitor X', 'track X', 'follow X'. "
-            "Use 'remove' when the user says 'stop monitoring X'. "
-            "Use 'list' when the user asks what is being monitored. "
-            "Do NOT add crypto, financial, or trading topics."
-        ),
-        "parameters": {
-            "type": "OBJECT",
-            "properties": {
-                "action": {
-                    "type":        "STRING",
-                    "description": "add | remove | list",
-                },
-                "topic": {
-                    "type":        "STRING",
-                    "description": "Topic to monitor or stop monitoring (e.g. 'space exploration', 'AI news')",
-                },
-            },
-            "required": ["action"],
-        },
-    },
-    {
-        "name": "shutdown_jarvis",
-        "description": (
-            "Shuts down the assistant completely. "
-            "Call this when the user expresses intent to end the conversation, "
-            "close the assistant, say goodbye, or stop Jarvis. "
-            "The user can say this in ANY language."
-        ),
-        "parameters": {
-            "type": "OBJECT",
-            "properties": {},
-        }
-    },
-    {
-    "name": "file_processor",
-    "description": (
-        "Processes any file that the user has uploaded or dropped onto the interface. "
-        "Use this when the user refers to an uploaded file and wants an action on it. "
-        "Supports: images (describe/ocr/resize/compress/convert), "
-        "PDFs (summarize/extract_text/to_word), "
-        "Word docs & text files (summarize/fix/reformat/translate), "
-        "CSV/Excel (analyze/stats/filter/sort/convert), "
-        "JSON/XML (validate/format/analyze), "
-        "code files (explain/review/fix/optimize/run/document/test), "
-        "audio (transcribe/trim/convert/info), "
-        "video (trim/extract_audio/extract_frame/compress/transcribe/info), "
-        "archives (list/extract), "
-        "presentations (summarize/extract_text). "
-        "ALWAYS call this tool when a file has been uploaded and the user gives a command about it. "
-        "If the user's command is ambiguous, pick the most logical action for that file type."
-    ),
-    "parameters": {
-        "type": "OBJECT",
-        "properties": {
-            "file_path": {
-                "type": "STRING",
-                "description": "Full path to the uploaded file. Leave empty to use the currently uploaded file."
-            },
-            "action": {
-                "type": "STRING",
-                "description": (
-                    "What to do with the file. Examples by type:\n"
-                    "image: describe | ocr | resize | compress | convert | info\n"
-                    "pdf: summarize | extract_text | to_word | info\n"
-                    "docx/txt: summarize | fix | reformat | translate_hint | word_count | to_bullet\n"
-                    "csv/excel: analyze | stats | filter | sort | convert | info\n"
-                    "json: validate | format | analyze | to_csv\n"
-                    "code: explain | review | fix | optimize | run | document | test\n"
-                    "audio: transcribe | trim | convert | info\n"
-                    "video: trim | extract_audio | extract_frame | compress | transcribe | info | convert\n"
-                    "archive: list | extract\n"
-                    "pptx: summarize | extract_text | analyze"
-                )
-            },
-            "instruction": {
-                "type": "STRING",
-                "description": "Free-form instruction if action doesn't cover it. E.g. 'translate this to Turkish', 'find all email addresses'"
-            },
-            "format": {
-                "type": "STRING",
-                "description": "Target format for conversion. E.g. 'mp3', 'pdf', 'csv', 'png'"
-            },
-            "width":     {"type": "INTEGER", "description": "Target width for image resize"},
-            "height":    {"type": "INTEGER", "description": "Target height for image resize"},
-            "scale":     {"type": "NUMBER",  "description": "Scale factor for image resize (e.g. 0.5)"},
-            "quality":   {"type": "INTEGER", "description": "Quality 1-100 for image/video compress"},
-            "start":     {"type": "STRING",  "description": "Start time for trim: seconds or HH:MM:SS"},
-            "end":       {"type": "STRING",  "description": "End time for trim: seconds or HH:MM:SS"},
-            "timestamp": {"type": "STRING",  "description": "Timestamp for video frame extraction HH:MM:SS"},
-            "column":    {"type": "STRING",  "description": "Column name for CSV filter/sort"},
-            "value":     {"type": "STRING",  "description": "Filter value for CSV filter"},
-            "condition": {"type": "STRING",  "description": "Filter condition: equals|contains|gt|lt"},
-            "ascending": {"type": "BOOLEAN", "description": "Sort order for CSV sort (default: true)"},
-            "save":      {"type": "BOOLEAN", "description": "Save result to file (default: true)"},
-            "destination": {"type": "STRING", "description": "Output folder for archive extract"},
-        },
-        "required": []
-    }
-},
-    {
-        "name": "save_memory",
-        "description": (
-            "Save an important personal fact about the user to long-term memory. "
-            "Call this silently whenever the user reveals something worth remembering: "
-            "name, age, city, job, preferences, hobbies, relationships, projects, or future plans. "
-            "Do NOT call for: weather, reminders, searches, or one-time commands. "
-            "Do NOT announce that you are saving — just call it silently. "
-            "Values must be in English regardless of the conversation language."
-        ),
-        "parameters": {
-            "type": "OBJECT",
-            "properties": {
-                "category": {
-                    "type": "STRING",
-                    "description": (
-                        "identity — name, age, birthday, city, job, language, nationality | "
-                        "preferences — favorite food/color/music/film/game/sport, hobbies | "
-                        "projects — active projects, goals, things being built | "
-                        "relationships — friends, family, partner, colleagues | "
-                        "wishes — future plans, things to buy, travel dreams | "
-                        "notes — habits, schedule, anything else worth remembering"
-                    )
-                },
-                "key":   {"type": "STRING", "description": "Short snake_case key (e.g. name, favorite_food, sister_name)"},
-                "value": {"type": "STRING", "description": "Concise value in English (e.g. Fatih, pizza, older sister)"},
-            },
-            "required": ["category", "key", "value"]
-        }
-    },
-]
+from orchestrator.tool_declarations import TOOL_DECLARATIONS
 
 # --- Plugin system ---
 
@@ -560,6 +132,10 @@ class JarvisLive:
         self.ui             = ui
         self.logger         = JarvisLogger(BASE_DIR)
         self._active_trace_id: str | None = None
+        self._model_capabilities_checked = False
+        self._coordination: CoordinationLifecycle | None = None
+        self._execution_gateway: ExecutionGateway | None = None
+        self._tool_intake: LegacyToolIntake | None = None
         self._asst_name     = "JARVIS"   # updated each session from config
         self.session              = None
         self.audio_in_queue       = None
@@ -584,6 +160,7 @@ class JarvisLive:
         self.ui.on_interrupt      = self.interrupt
         self.ui.on_barge_in_changed = self._set_barge_in
         self.ui.on_open_debug_logs = self.logger.get_events
+        self.ui.on_debug_log_sources = self.logger.get_sources
         self._turn_done_event: asyncio.Event | None = None
         self._dashboard     = None
         self._briefing_sent    = False          # morning briefing fires once per process
@@ -774,7 +351,8 @@ class JarvisLive:
             ),
         )
 
-    async def _execute_tool(self, fc) -> types.FunctionResponse:
+    async def _legacy_direct_tool_dispatch(self, fc) -> types.FunctionResponse:
+        """Retained only as rollback code until the Milestone 9 staged cutover."""
         name = fc.name
         args = dict(fc.args or {})
         trace_id = self._active_trace_id or self.logger.new_trace_id()
@@ -953,6 +531,7 @@ class JarvisLive:
                         except Exception:
                             pass
                     await asyncio.sleep(1.5)
+                    await self._stop_coordination()
                     import os as _os
                     _os._exit(0)
                 asyncio.create_task(_do_shutdown())
@@ -984,6 +563,283 @@ class JarvisLive:
         return types.FunctionResponse(
             id=fc.id, name=name,
             response={"result": result}
+        )
+
+    def _build_tool_adapters(self) -> ToolAdapterRegistry:
+        def action(function, default, **fixed):
+            async def handler(arguments):
+                result = await asyncio.to_thread(
+                    function, parameters=arguments, **fixed
+                )
+                return default(arguments) if not result and callable(default) else (
+                    default if not result else result
+                )
+
+            return handler
+
+        adapters = {
+            "open_app": CallableToolAdapter(
+                "open_app",
+                action(
+                    open_app,
+                    lambda values: f"Opened {values.get('app_name')}.",
+                    response=None,
+                    player=self.ui,
+                ),
+            ),
+            "weather_report": CallableToolAdapter(
+                "weather_report",
+                action(weather_action, "Weather delivered.", player=self.ui),
+            ),
+            "browser_control": CallableToolAdapter(
+                "browser_control",
+                action(browser_control, "Done.", player=self.ui),
+            ),
+            "file_controller": CallableToolAdapter(
+                "file_controller",
+                action(file_controller, "Done.", player=self.ui),
+            ),
+            "send_message": CallableToolAdapter(
+                "send_message",
+                action(
+                    send_message,
+                    "Message sent.",
+                    response=None,
+                    player=self.ui,
+                    session_memory=None,
+                ),
+            ),
+            "reminder": CallableToolAdapter(
+                "reminder",
+                action(reminder, "Reminder set.", response=None, player=self.ui),
+            ),
+            "youtube_video": CallableToolAdapter(
+                "youtube_video",
+                action(
+                    youtube_video, "Done.", response=None, player=self.ui
+                ),
+            ),
+            "screen_process": CallableToolAdapter(
+                "screen_process", self._adapter_screen_process
+            ),
+            "close_camera": CallableToolAdapter(
+                "close_camera", self._adapter_close_camera
+            ),
+            "computer_settings": CallableToolAdapter(
+                "computer_settings",
+                action(
+                    computer_settings, "Done.", response=None, player=self.ui
+                ),
+            ),
+            "desktop_control": CallableToolAdapter(
+                "desktop_control",
+                action(desktop_control, "Done.", player=self.ui),
+            ),
+            "code_helper": CallableToolAdapter(
+                "code_helper",
+                action(
+                    code_helper, "Done.", player=self.ui, speak=self.speak
+                ),
+            ),
+            "dev_agent": CallableToolAdapter(
+                "dev_agent",
+                action(dev_agent, "Done.", player=self.ui, speak=self.speak),
+            ),
+            "web_search": CallableToolAdapter(
+                "web_search", self._adapter_web_search
+            ),
+            "file_processor": CallableToolAdapter(
+                "file_processor",
+                action(
+                    file_processor, "Done.", player=self.ui, speak=self.speak
+                ),
+            ),
+            "computer_control": CallableToolAdapter(
+                "computer_control",
+                action(computer_control, "Done.", player=self.ui),
+            ),
+            "game_updater": CallableToolAdapter(
+                "game_updater",
+                action(
+                    game_updater, "Done.", player=self.ui, speak=self.speak
+                ),
+            ),
+            "flight_finder": CallableToolAdapter(
+                "flight_finder",
+                action(flight_finder, "Done.", player=self.ui),
+            ),
+            "system_status": CallableToolAdapter(
+                "system_status", self._adapter_system_status
+            ),
+            "manage_monitor": CallableToolAdapter(
+                "manage_monitor", self._adapter_manage_monitor
+            ),
+            "shutdown_jarvis": CallableToolAdapter(
+                "shutdown_jarvis", self._adapter_shutdown_jarvis
+            ),
+            "save_memory": CallableToolAdapter(
+                "save_memory", self._adapter_save_memory
+            ),
+        }
+        return ToolAdapterRegistry(adapters)
+
+    async def _adapter_save_memory(self, arguments):
+        category = arguments.get("category", "notes")
+        key = arguments.get("key", "")
+        value = arguments.get("value", "")
+        if key and value:
+            await asyncio.to_thread(
+                update_memory, {category: {key: {"value": value}}}
+            )
+        return "ok" if key and value else "Memory update was incomplete."
+
+    async def _adapter_screen_process(self, arguments):
+        now = time.monotonic()
+        cooldown = 4.0
+        if self._vision_busy or (now - self._vision_last_time) < cooldown:
+            return "Vision is still processing the previous request."
+        self._vision_busy = True
+        self._vision_last_time = now
+        angle = arguments.get("angle", "screen").lower()
+        user_text = arguments.get("text", "What do you see?")
+        if angle == "camera":
+            image, mime_type = await asyncio.to_thread(_capture_camera)
+            self.ui.start_camera_stream()
+            self._vision_cam_active = True
+            source = "camera"
+        else:
+            image, mime_type = await asyncio.to_thread(_capture_screen)
+            source = "screen"
+        self._pending_vision = (image, mime_type, user_text, angle)
+        return (
+            f"[VISION_ACTIVE] {source.capitalize()} captured. "
+            "The actual image arrives in the next message."
+        )
+
+    async def _adapter_close_camera(self, arguments):
+        self.ui.stop_camera_stream()
+        return "Camera closed."
+
+    async def _adapter_web_search(self, arguments):
+        result = await asyncio.to_thread(
+            web_search_action, parameters=arguments, player=self.ui
+        )
+        result = result or "Done."
+        mode = arguments.get("mode", "search")
+        if result and not result.startswith(("No results", "Search failed")):
+            query = arguments.get("query") or ", ".join(arguments.get("items", []))
+            label = f"{mode.upper()} — {query[:38]}" if query else mode.upper()
+            self.ui.show_content(label, result)
+        return result
+
+    async def _adapter_system_status(self, arguments):
+        return str(await asyncio.to_thread(get_system_status))
+
+    async def _adapter_manage_monitor(self, arguments):
+        operation = arguments.get("action", "").lower().strip()
+        topic = arguments.get("topic", "").strip()
+        if operation == "add" and topic:
+            return await asyncio.to_thread(add_monitor, topic)
+        if operation == "remove" and topic:
+            return await asyncio.to_thread(remove_monitor, topic)
+        if operation == "list":
+            topics = await asyncio.to_thread(list_monitors)
+            return "Monitoring: " + ", ".join(topics) if topics else "No topics are being monitored."
+        return "Specify action and a topic."
+
+    async def _adapter_shutdown_jarvis(self, arguments):
+        self.ui.write_log("SYS: Shutdown requested.")
+
+        async def shutdown():
+            await self._save_session_summary()
+            if self.session:
+                try:
+                    await self._send_text("Say a brief natural goodbye to the user.")
+                except Exception:
+                    pass
+            await asyncio.sleep(1.5)
+            await self._stop_coordination()
+            import os as local_os
+            local_os._exit(0)
+
+        asyncio.create_task(shutdown())
+        return "Shutdown scheduled."
+
+    async def _execute_tool(self, fc) -> types.FunctionResponse:
+        name = fc.name
+        arguments = dict(fc.args or {})
+        if name == "file_processor" and not arguments.get("file_path"):
+            if self.ui.current_file:
+                arguments["file_path"] = self.ui.current_file
+        trace_id = self._active_trace_id or self.logger.new_trace_id()
+        started = time.monotonic()
+        self.ui.set_state("THINKING")
+        self.logger.log(
+            "info", "execution_gateway", "tool_request",
+            f"Gateway request received for {name}.",
+            trace_id=trace_id,
+            tool_name=name,
+        )
+        intake = self._tool_intake
+        if intake is None:
+            result = "The safety gateway is not available; the action was not executed."
+            disposition = "gateway_unavailable"
+        else:
+            try:
+                gateway_result = await intake.execute(
+                    session_id=self.logger.session_id,
+                    trace_id=trace_id,
+                    call_id=str(fc.id or self.logger.new_trace_id()),
+                    tool_name=name,
+                    arguments=arguments,
+                )
+                disposition = gateway_result.disposition.value
+                if gateway_result.disposition is GatewayDisposition.EXECUTED:
+                    result = gateway_result.output or "Done."
+                    self.ui.write_log(f"ACTION: {name} completed through safety gateway.")
+                elif gateway_result.disposition is GatewayDisposition.APPROVAL_REQUIRED:
+                    result = (
+                        "This action requires confirmation in the trusted desktop "
+                        "approval interface and was not executed."
+                    )
+                    self.ui.write_log(
+                        f"APPROVAL: {name} is waiting for trusted confirmation."
+                    )
+                elif gateway_result.disposition is GatewayDisposition.REPLAYED:
+                    result = "This action was already processed and was not repeated."
+                elif gateway_result.disposition is GatewayDisposition.OUTCOME_UNKNOWN:
+                    result = (
+                        "The action outcome could not be proven. It will not be retried "
+                        "without verification."
+                    )
+                elif gateway_result.disposition is GatewayDisposition.FAILED:
+                    result = "The action failed safely; see Debug Logs."
+                else:
+                    result = "Safety policy denied this action; it was not executed."
+            except Exception as exc:
+                disposition = "gateway_error"
+                result = "The safety gateway failed closed; the action was not executed."
+                self.logger.log(
+                    "error", "execution_gateway", "gateway_error",
+                    "Tool gateway failed closed.",
+                    trace_id=trace_id,
+                    tool_name=name,
+                    result={"error_type": type(exc).__name__},
+                )
+        if not self.ui.muted:
+            self.ui.set_state("LISTENING")
+        self.logger.log(
+            "info", "execution_gateway", "tool_result",
+            f"Gateway request finished for {name}.",
+            trace_id=trace_id,
+            tool_name=name,
+            result={"disposition": disposition, "result_chars": len(str(result))},
+            duration_ms=(time.monotonic() - started) * 1000,
+        )
+        return types.FunctionResponse(
+            id=fc.id,
+            name=name,
+            response={"result": result},
         )
 
     async def _send_realtime(self):
@@ -1131,6 +987,10 @@ class JarvisLive:
                             out_buf = _merge_transcript(
                                 out_buf, sc.output_transcription.text
                             )
+                            if out_buf:
+                                self.ui.update_transcript(
+                                    "assistant", out_buf, final=False
+                                )
 
                         if sc.input_transcription and sc.input_transcription.text:
                             merged = _merge_transcript(
@@ -1139,6 +999,9 @@ class JarvisLive:
                             if merged:
                                 in_buf = merged
                                 self._last_user_speech = time.monotonic()
+                                self.ui.update_transcript(
+                                    "user", in_buf, final=False
+                                )
 
                         if sc.turn_complete:
                             if self._turn_done_event:
@@ -1150,6 +1013,8 @@ class JarvisLive:
                                 self._interrupted = False
                                 in_buf  = ""
                                 out_buf = ""
+                                self.ui.update_transcript("user", "", final=True)
+                                self.ui.update_transcript("assistant", "", final=True)
                                 continue
 
                             full_in = in_buf.strip()
@@ -1421,7 +1286,7 @@ class JarvisLive:
             client = _genai.Client(api_key=_get_api_key())
             resp   = await asyncio.to_thread(
                 client.models.generate_content,
-                model="gemini-2.5-flash",
+                model=ORCHESTRATOR_CONFIG.models.planner.name,
                 contents=prompt,
             )
             summary = (resp.text or "").strip()
@@ -1569,7 +1434,96 @@ class JarvisLive:
 
     # ── main loop ───────────────────────────────────────────────────────────
 
+    def _report_coordination_health(self, health: CoordinationHealth) -> None:
+        result = {
+            "mode": health.mode.value,
+            "redis_available": health.redis_available,
+            "circuit_state": health.circuit_state.value,
+            "consecutive_failures": health.consecutive_failures,
+            "reason_code": health.reason_code,
+        }
+        if health.mode is CoordinationMode.REDIS:
+            self.logger.log(
+                "info", "coordination", "coordination_health",
+                "Redis coordination connected.", result=result,
+            )
+            self.ui.write_log("SYS: Redis coordination connected.")
+            return
+
+        reason = health.reason_code or "redis_unavailable"
+        self.logger.log(
+            "warn", "coordination", "coordination_health",
+            "Redis coordination unavailable; SQLite degraded mode active.",
+            result=result,
+        )
+        self.ui.write_log(
+            f"WARN: Redis unavailable ({reason}); SQLite degraded mode active."
+        )
+
+    def _report_coordination_error(self, exc: Exception) -> None:
+        self.logger.log(
+            "error", "coordination", "coordination_monitor_error",
+            "Coordination health monitor failed unexpectedly.",
+            result={"error_type": type(exc).__name__},
+        )
+
+    async def _start_coordination(self) -> None:
+        try:
+            self._coordination = create_application_coordination(
+                BASE_DIR,
+                ORCHESTRATOR_CONFIG,
+                on_health=self._report_coordination_health,
+                on_error=self._report_coordination_error,
+            )
+            await self._coordination.start()
+            adapters = self._build_tool_adapters()
+            self._execution_gateway = ExecutionGateway(
+                self._coordination.runtime.store,
+                adapters,
+                ORCHESTRATOR_CONFIG,
+            )
+            self._tool_intake = LegacyToolIntake(
+                self._coordination.runtime.store,
+                self._execution_gateway,
+            )
+        except Exception as exc:
+            self.logger.log(
+                "error", "coordination", "coordination_startup_failed",
+                "Coordination startup failed.",
+                result={"error_type": type(exc).__name__},
+            )
+            self.ui.write_log("ERR: Coordination startup failed; check Debug Logs.")
+            raise
+
+    async def _stop_coordination(self) -> None:
+        self._tool_intake = None
+        self._execution_gateway = None
+        lifecycle = self._coordination
+        self._coordination = None
+        if lifecycle is None:
+            return
+        try:
+            await lifecycle.stop()
+            self.logger.log(
+                "info", "coordination", "coordination_stopped",
+                "Redis coordination stopped cleanly.",
+            )
+        except Exception as exc:
+            self.logger.log(
+                "warn", "coordination", "coordination_shutdown_failed",
+                "Redis coordination shutdown reported an error.",
+                result={"error_type": type(exc).__name__},
+            )
+
     async def run(self):
+        self._loop = asyncio.get_event_loop()
+        try:
+            await self._start_coordination()
+            await self._run_application()
+        finally:
+            await self._stop_coordination()
+
+    async def _run_application(self):
         self._loop = asyncio.get_event_loop()
         self.logger.log("info", "system", "system", "JARVIS runtime started.")
 
@@ -1596,6 +1550,53 @@ class JarvisLive:
                     api_key=_get_api_key(),
                     http_options={"api_version": "v1beta"}
                 )
+
+                if (
+                    ORCHESTRATOR_CONFIG.capability_checks.enabled
+                    and not self._model_capabilities_checked
+                ):
+                    provider = (
+                        GoogleModelMetadataProvider(client)
+                        if ORCHESTRATOR_CONFIG.capability_checks.remote_metadata_check
+                        else None
+                    )
+                    capability_report = await asyncio.to_thread(
+                        check_model_capabilities,
+                        ORCHESTRATOR_CONFIG,
+                        provider,
+                    )
+                    for check in capability_report.checks:
+                        self.logger.log(
+                            "warn" if check.status is CapabilityStatus.WARNING else (
+                                "error" if check.status is CapabilityStatus.FAIL else "info"
+                            ),
+                            "model_registry",
+                            "model_capability_check",
+                            f"Model capability check {check.status.value}: {check.role.value}.",
+                            result={
+                                "model_name": check.model_name,
+                                "status": check.status.value,
+                                "missing": sorted(item.value for item in check.missing),
+                                "remote_checked": check.remote_checked,
+                            },
+                        )
+                    fatal_local = any(
+                        check.status is CapabilityStatus.FAIL and not check.remote_checked
+                        for check in capability_report.checks
+                    )
+                    fatal_remote = any(
+                        check.status is CapabilityStatus.FAIL and check.remote_checked
+                        for check in capability_report.checks
+                    )
+                    if (
+                        fatal_local
+                        and ORCHESTRATOR_CONFIG.capability_checks.fail_startup_on_local_mismatch
+                    ) or (
+                        fatal_remote
+                        and ORCHESTRATOR_CONFIG.capability_checks.fail_startup_on_remote_unavailable
+                    ):
+                        raise RuntimeError("Configured model capability validation failed.")
+                    self._model_capabilities_checked = True
 
                 async with (
                     client.aio.live.connect(model=LIVE_MODEL, config=config) as session,
