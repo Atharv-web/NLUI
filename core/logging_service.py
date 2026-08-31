@@ -35,7 +35,7 @@ class JarvisLogger:
         self.logs_dir = base_dir / "logs"
         self.retention_days = retention_days
         self.session_id = uuid.uuid4().hex
-        self._queue: queue.Queue[dict[str, Any] | None] = queue.Queue(maxsize=2_000)
+        self._queue: queue.Queue[dict[str, Any] | threading.Event | None] = queue.Queue(maxsize=2_000)
         self._closed = threading.Event()
         self._worker = threading.Thread(target=self._write_loop, name="jarvis-log-writer", daemon=True)
         self._cleanup_old_logs()
@@ -99,9 +99,12 @@ class JarvisLogger:
         limit: int = 1_000,
     ) -> list[dict[str, Any]]:
         """Return recent local events for the desktop-only debug viewer."""
+        # The writer is asynchronous. A short barrier makes an explicit UI
+        # refresh include events queued before the user requested it.
+        self.flush(timeout=0.5)
         events: list[dict[str, Any]] = []
         try:
-            for file_path in sorted(self.logs_dir.glob("*/*.jsonl"), reverse=True):
+            for file_path in self.logs_dir.glob("*/*.jsonl"):
                 with file_path.open("r", encoding="utf-8") as handle:
                     for line in handle:
                         with suppress(json.JSONDecodeError):
@@ -114,11 +117,40 @@ class JarvisLogger:
                             if query and query.lower() not in haystack:
                                 continue
                             events.append(event)
-                if len(events) >= limit:
-                    break
         except Exception:
-            return events[-limit:]
-        return events[-limit:]
+            pass
+
+        # Session filenames are UUIDs, so filesystem ordering is not event
+        # ordering. Sort by the ISO timestamp before applying the recent limit.
+        events.sort(key=lambda event: str(event.get("timestamp", "")))
+        return events[-limit:] if limit > 0 else []
+
+    def get_sources(self) -> list[str]:
+        """Return the source values that actually exist in local logs."""
+        self.flush(timeout=0.5)
+        sources: set[str] = set()
+        try:
+            for file_path in self.logs_dir.glob("*/*.jsonl"):
+                with file_path.open("r", encoding="utf-8") as handle:
+                    for line in handle:
+                        with suppress(json.JSONDecodeError):
+                            source = json.loads(line).get("source")
+                            if isinstance(source, str) and source:
+                                sources.add(source)
+        except Exception:
+            pass
+        return sorted(sources)
+
+    def flush(self, timeout: float = 1.0) -> bool:
+        """Wait briefly for events already in the queue to reach disk."""
+        if self._closed.is_set():
+            return False
+        barrier = threading.Event()
+        try:
+            self._queue.put_nowait(barrier)
+        except queue.Full:
+            return False
+        return barrier.wait(max(0.0, timeout))
 
     def close(self) -> None:
         if self._closed.is_set():
@@ -134,6 +166,9 @@ class JarvisLogger:
             event = self._queue.get()
             if event is None:
                 return
+            if isinstance(event, threading.Event):
+                event.set()
+                continue
             try:
                 now = datetime.now()
                 day_dir = self.logs_dir / now.strftime("%Y-%m-%d")
