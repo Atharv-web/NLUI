@@ -19,7 +19,9 @@ ENV/
 !.env.example
 !.env.template
 config/api_keys.json
-!config/api_keys.example.json
+config/api_keys.example.json
+config/orchestrator.json
+config/orchestrator.example.json
 config/certs/
 *.key
 *.pem
@@ -62,8 +64,7 @@ htmlcov/
 .ruff_cache/
 
 # Playwright and browser-test artifacts
-test-results/
-tests/
+/test-results/
 playwright-report/
 blob-report/
 playwright/.cache/
@@ -92,3 +93,7 @@ $RECYCLE.BIN/
 *.bak
 *.orig
 ~$*
+
+# miscellenous
+docs/
+tests/
