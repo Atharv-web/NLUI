@@ -1,7 +1,13 @@
 #web_search.py
+import html
 import json
+import re
 import sys
+import xml.etree.ElementTree as ET
 from pathlib import Path
+from urllib.parse import quote_plus, urlparse
+
+from orchestrator.runtime_models import PLANNER_MODEL
 
 def _get_base_dir() -> Path:
     if getattr(sys, "frozen", False):
@@ -23,7 +29,7 @@ def _gemini_search(query: str) -> str:
 
     client   = genai.Client(api_key=_get_api_key())
     response = client.models.generate_content(
-        model="gemini-2.5-flash",
+        model=PLANNER_MODEL,
         contents=query,
         config={"tools": [{"google_search": {}}]},
     )
@@ -74,8 +80,117 @@ def _ddg_news(query: str, max_results: int = 8) -> list[dict]:
                     "source":  r.get("source", ""),
                 })
     except Exception as e:
-        print(f"[WebSearch] ⚠️ DDG news() failed ({e}) — falling back to text search")
-        results = _ddg_search(query, max_results=max_results)
+        # A normal text search returns section pages such as Reuters World or
+        # Google News topics. Those are not articles, so let the dedicated RSS
+        # fallback handle this failure instead.
+        print(f"[WebSearch] DDG news() failed ({e})")
+    return results
+
+
+_NEWS_LANDING_TITLES = (
+    "world news | latest top stories",
+    "google news - world",
+    "world | latest news & updates",
+    "breaking news, latest news",
+)
+_NEWS_LANDING_PATHS = {
+    "", "/", "/news", "/world", "/world/", "/international", "/latest",
+}
+
+
+def _clean_text(value: str) -> str:
+    without_tags = re.sub(r"<[^>]+>", " ", value or "")
+    return " ".join(html.unescape(without_tags).split())
+
+
+def _is_article_result(result: dict) -> bool:
+    title = _clean_text(str(result.get("title", "")))
+    url = str(result.get("url", "")).strip()
+    if not title or not url:
+        return False
+
+    parsed = urlparse(url)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return False
+
+    title_lower = title.casefold()
+    if any(pattern in title_lower for pattern in _NEWS_LANDING_TITLES):
+        return False
+
+    path_lower = parsed.path.casefold()
+    if path_lower in _NEWS_LANDING_PATHS:
+        return False
+    if parsed.netloc.casefold().endswith("news.google.com") and path_lower.startswith("/topics/"):
+        return False
+    return True
+
+
+def _clean_news_results(results: list[dict], limit: int = 5) -> list[dict]:
+    cleaned = []
+    seen_urls = set()
+    seen_titles = set()
+    for result in results:
+        if not _is_article_result(result):
+            continue
+
+        title = _clean_text(str(result.get("title", "")))
+        url = str(result.get("url", "")).strip()
+        title_key = title.casefold()
+        url_key = url.rstrip("/").casefold()
+        if title_key in seen_titles or url_key in seen_urls:
+            continue
+
+        cleaned.append({
+            "title": title,
+            "snippet": _clean_text(str(result.get("snippet", ""))),
+            "url": url,
+            "source": _clean_text(str(result.get("source", ""))),
+        })
+        seen_titles.add(title_key)
+        seen_urls.add(url_key)
+        if len(cleaned) >= limit:
+            break
+    return cleaned
+
+
+def _google_news_rss(query: str, max_results: int = 8) -> list[dict]:
+    """Fetch current article headlines from Google News RSS."""
+    import requests
+
+    if "world news" in query.casefold():
+        url = (
+            "https://news.google.com/rss/headlines/section/topic/WORLD"
+            "?hl=en-IN&gl=IN&ceid=IN:en"
+        )
+    else:
+        search_terms = f"{query} when:2d"
+        url = (
+            "https://news.google.com/rss/search"
+            f"?q={quote_plus(search_terms)}&hl=en-IN&gl=IN&ceid=IN:en"
+        )
+    response = requests.get(
+        url,
+        headers={"User-Agent": "Mozilla/5.0 (compatible; MARK-L/1.0)"},
+        timeout=8,
+    )
+    response.raise_for_status()
+    root = ET.fromstring(response.content)
+
+    results = []
+    for item in root.findall(".//item"):
+        title = _clean_text(item.findtext("title", default=""))
+        article_url = (item.findtext("link", default="") or "").strip()
+        source = _clean_text(item.findtext("source", default=""))
+        if source and title.casefold().endswith(f" - {source}".casefold()):
+            title = title[:-(len(source) + 3)].strip()
+        results.append({
+            "title": title,
+            "snippet": "",
+            "url": article_url,
+            "source": source,
+        })
+        if len(results) >= max_results:
+            break
     return results
 
 
@@ -93,21 +208,14 @@ def _format_ddg(query: str, results: list[dict]) -> str:
 
 
 def _format_news(query: str, results: list[dict]) -> str:
-    if not results:
+    articles = _clean_news_results(results)
+    if not articles:
         return f"No news found for: {query}"
 
-    lines = [f"Latest news: {query}\n"]
-    for i, r in enumerate(results, 1):
-        title = r.get("title", "")
-        if not title:
-            continue
-        src = f"  [{r['source']}]" if r.get("source") else ""
-        lines.append(f"{i}. {title}{src}")
-        if r.get("snippet"):
-            lines.append(f"   {r['snippet'][:140]}")
-        if r.get("url"):
-            lines.append(f"   {r['url']}")
-        lines.append("")
+    lines = [
+        f"{i}. [{article['title']}]({article['url']})"
+        for i, article in enumerate(articles, 1)
+    ]
     return "\n".join(lines).strip()
 
 
@@ -124,7 +232,7 @@ def _gemini_headlines(n: int = 5) -> tuple[list[str], str]:
 
     client = genai.Client(api_key=_get_api_key())
     response = client.models.generate_content(
-        model="gemini-2.5-flash",
+            model=PLANNER_MODEL,
         contents=f"Current world news: {n} headlines. Numbered list, titles only.",
         config={"tools": [{"google_search": {}}]},
     )
@@ -164,24 +272,25 @@ def _search(query: str) -> str:
 
 def _news(query: str) -> str:
     """
-    Runs Gemini grounded search AND DDG news in parallel.
-    Returns whichever delivers a valid result first; cancels the other.
+    Runs two article-specific news sources in parallel.
+    Generic web search is deliberately excluded because it returns publisher
+    homepages and topic pages instead of current articles.
     """
     import threading
 
-    gemini_query = f"latest news today: {query}" if query else "top world news today"
-    ddg_query    = query if query else "world news today"
+    news_query = query if query else "world news today"
 
     result_box  = [None]   # first valid result lands here
     lock        = threading.Lock()
     done_evt    = threading.Event()
     failures    = [0]
 
-    def _store(r: str) -> None:
-        if r and len(r) > 60:
+    def _store(results: list[dict]) -> None:
+        formatted = _format_news(news_query, results)
+        if results and not formatted.startswith("No news found"):
             with lock:
                 if result_box[0] is None:
-                    result_box[0] = r
+                    result_box[0] = formatted
             done_evt.set()
         else:
             with lock:
@@ -189,26 +298,25 @@ def _news(query: str) -> str:
                 if failures[0] >= 2:   # both failed — unblock caller
                     done_evt.set()
 
-    def _try_gemini():
+    def _try_rss():
         try:
-            _store(_gemini_search(gemini_query))
+            _store(_google_news_rss(news_query, max_results=8))
         except Exception as e:
-            print(f"[WebSearch] ⚠️ Gemini news failed ({e})")
-            _store("")
+            print(f"[WebSearch] Google News RSS failed ({e})")
+            _store([])
 
     def _try_ddg():
         try:
-            results = _ddg_news(ddg_query, max_results=8)
-            _store(_format_news(ddg_query, results))
+            _store(_ddg_news(news_query, max_results=8))
         except Exception as e:
-            print(f"[WebSearch] ⚠️ DDG news failed ({e})")
-            _store("")
+            print(f"[WebSearch] DDG news failed ({e})")
+            _store([])
 
-    threading.Thread(target=_try_gemini, daemon=True).start()
+    threading.Thread(target=_try_rss, daemon=True).start()
     threading.Thread(target=_try_ddg,    daemon=True).start()
 
     done_evt.wait(timeout=10.0)
-    return result_box[0] or f"No news found for: {query}"
+    return result_box[0] or f"No news found for: {news_query}"
 
 
 def _research(query: str) -> str:

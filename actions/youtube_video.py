@@ -9,6 +9,8 @@ from pathlib import Path
 from datetime import datetime
 from urllib.parse import quote_plus
 
+from orchestrator.runtime_models import PLANNER_MODEL
+
 try:
     import pyautogui
     _PYAUTOGUI = True
@@ -174,7 +176,7 @@ def _summarize_with_gemini(transcript: str, video_url: str) -> str:
     max_chars = 80000
     truncated = transcript[:max_chars] + ("..." if len(transcript) > max_chars else "")
     response  = _client.models.generate_content(
-        model="gemini-2.5-flash",
+        model=PLANNER_MODEL,
         contents=f"Please summarize this YouTube video transcript:\n\n{truncated}",
         config=types.GenerateContentConfig(
             system_instruction=(

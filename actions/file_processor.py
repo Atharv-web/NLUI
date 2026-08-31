@@ -25,6 +25,8 @@ import tempfile
 from pathlib import Path
 from datetime import datetime
 
+from orchestrator.runtime_models import PLANNER_MODEL
+
 def _get_api_key() -> str:
     config_path = Path(__file__).resolve().parent.parent / "config" / "api_keys.json"
     with open(config_path, "r", encoding="utf-8") as f:
@@ -37,7 +39,7 @@ def _gemini_client():
 
     class _W:
         def generate_content(self, contents):
-            return _c.models.generate_content(model="gemini-2.5-flash", contents=contents)
+            return _c.models.generate_content(model=PLANNER_MODEL, contents=contents)
 
     return _W()
 

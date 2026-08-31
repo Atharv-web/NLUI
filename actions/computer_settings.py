@@ -7,6 +7,8 @@ import subprocess
 import platform
 from pathlib import Path
 
+from orchestrator.runtime_models import ROUTINE_MODEL
+
 try:
     import pyautogui
     pyautogui.FAILSAFE = True
@@ -613,7 +615,7 @@ Rules:
 - Return ONLY the JSON, no explanation, no markdown."""
 
     try:
-        resp = _client.models.generate_content(model="gemini-2.5-flash-lite", contents=prompt)
+        resp = _client.models.generate_content(model=ROUTINE_MODEL, contents=prompt)
         text = re.sub(r"```(?:json)?", "", resp.text).strip().rstrip("`").strip()
         return json.loads(text)
     except Exception as e:
