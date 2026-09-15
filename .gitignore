@@ -97,3 +97,9 @@ $RECYCLE.BIN/
 # miscellenous
 docs/
 tests/
+tests/
+tests/*.py
+docs/
+!docs/orchestrator/
+!docs/orchestrator/*.md
+scripts/
