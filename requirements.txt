@@ -21,7 +21,6 @@ fastapi
 uvicorn[standard]
 cryptography
 keyring>=25.7,<26
-redis==8.1.0
 python-multipart
 comtypes; sys_platform == "win32"
 pycaw; sys_platform == "win32"
