@@ -1,4 +1,5 @@
 from __future__ import annotations
+from core.diagnostics import diagnostic
 
 import json
 import html
@@ -99,7 +100,7 @@ def load_ui_font(app: QApplication | None = None) -> bool:
             if families:
                 _UI_FONT_FAMILY = families[0]
         else:
-            print(f"[UI] Bundled font could not be loaded: {UI_FONT_FILE}")
+            diagnostic(f"[UI] Bundled font could not be loaded: {UI_FONT_FILE}")
 
     if _BODY_FONT_ID is None:
         _BODY_FONT_ID = QFontDatabase.addApplicationFont(str(BODY_FONT_FILE))
@@ -108,7 +109,7 @@ def load_ui_font(app: QApplication | None = None) -> bool:
             if families:
                 _BODY_FONT_FAMILY = families[0]
         else:
-            print(f"[UI] Bundled body font could not be loaded: {BODY_FONT_FILE}")
+            diagnostic(f"[UI] Bundled body font could not be loaded: {BODY_FONT_FILE}")
 
     if app is not None:
         base = _QtFont(_BODY_FONT_FAMILY, 10)
@@ -2232,6 +2233,9 @@ class MainWindow(QMainWindow):
         self.on_barge_in_changed = None # callable: (enabled: bool) -> None
         self.on_open_debug_logs = None  # callable: keyword filters -> redacted event list
         self.on_debug_log_sources = None  # callable: () -> available source names
+        self.on_orchestrator_snapshot = None
+        self.on_orchestrator_action = None
+        self._task_center = None
         self._muted            = False
         self._current_file: str | None = None
         self._remote_overlay: RemoteKeyOverlay | None = None
@@ -2468,7 +2472,7 @@ class MainWindow(QMainWindow):
                     self._cam_frame_sig.emit(buf.tobytes())
             cap.release()
         except Exception as e:
-            print(f"[Camera] Stream error: {e}")
+            diagnostic(f"[Camera] Stream error: {e}")
         finally:
             self._cam_stream_sig.emit(False)
 
@@ -2575,7 +2579,7 @@ class MainWindow(QMainWindow):
             )
             return True
         except Exception as e:
-            print(f"[Shortcut] ⚠️  Icon generation failed: {e}")
+            diagnostic(f"[Shortcut] ⚠️  Icon generation failed: {e}")
             return False
 
     @staticmethod
@@ -3076,6 +3080,10 @@ class MainWindow(QMainWindow):
         lay.addWidget(self._system_btn)
         lay.addWidget(self._activity_btn)
         lay.addWidget(self._files_btn)
+        self._tasks_btn = _tool("TASKS", "Plans, approvals and task history")
+        self._tasks_btn.setCheckable(False)
+        self._tasks_btn.clicked.connect(self._open_task_center)
+        lay.addWidget(self._tasks_btn)
 
         clock = QVBoxLayout()
         clock.setSpacing(0)
@@ -3100,6 +3108,18 @@ class MainWindow(QMainWindow):
     def _tick_clock(self):
         self._clock_lbl.setText(time.strftime("%H:%M:%S"))
         self._date_lbl.setText(time.strftime("%a %d %b %Y"))
+
+    def _open_task_center(self):
+        from orchestrator_ui import TaskCenterDialog
+        if self._task_center is None:
+            self._task_center = TaskCenterDialog(self,
+                snapshot=lambda: self.on_orchestrator_snapshot() if self.on_orchestrator_snapshot else None,
+                action=lambda name, **kwargs: self.on_orchestrator_action(name, **kwargs) if self.on_orchestrator_action else None,
+                assistant_name=self._assistant_name)
+        self._task_center.show()
+        self._task_center.raise_()
+        self._task_center.activateWindow()
+        self._task_center.refresh()
 
     def _build_left_panel_legacy(self) -> QWidget:
         w = QWidget()
@@ -4298,6 +4318,22 @@ class JarvisUI:
 
     def notify_phone_connected(self) -> None:
         self._win.notify_phone_connected()
+
+    @property
+    def on_orchestrator_snapshot(self):
+        return self._win.on_orchestrator_snapshot
+
+    @on_orchestrator_snapshot.setter
+    def on_orchestrator_snapshot(self, callback):
+        self._win.on_orchestrator_snapshot = callback
+
+    @property
+    def on_orchestrator_action(self):
+        return self._win.on_orchestrator_action
+
+    @on_orchestrator_action.setter
+    def on_orchestrator_action(self, callback):
+        self._win.on_orchestrator_action = callback
 
     def set_state(self, state: str):
         self._win._state_sig.emit(state)

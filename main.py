@@ -1,3 +1,4 @@
+from core.diagnostics import diagnostic
 import platform as _platform
 import subprocess as _subprocess
 
@@ -21,7 +22,7 @@ import time
 import json
 import sys
 import traceback
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 import sounddevice as sd
@@ -29,23 +30,21 @@ from google import genai
 from google.genai import types
 from ui import JarvisUI
 from core.logging_service import JarvisLogger
+from core.diagnostics import install_logger
 from orchestrator.model_capabilities import (
     CapabilityStatus,
     GoogleModelMetadataProvider,
     check_model_capabilities,
 )
 from orchestrator.runtime_models import RUNTIME_ORCHESTRATOR_CONFIG, VOICE_MODEL
-from orchestrator.coordination import (
-    CoordinationHealth,
-    CoordinationLifecycle,
-    CoordinationMode,
-    create_application_coordination,
-)
+from orchestrator.local_runtime import LocalRuntime, create_local_runtime
+from orchestrator.engine import LocalOrchestrator
+from orchestrator.contracts import Intent, TaskMode
+from orchestrator.planner import StructuredPlanner, GeminiPlanGenerator
 from orchestrator.safety import (
     CallableToolAdapter,
     ExecutionGateway,
     GatewayDisposition,
-    LegacyToolIntake,
     ToolAdapterRegistry,
 )
 from core.live_audio import (
@@ -68,10 +67,7 @@ from actions.computer_settings import computer_settings
 from actions.screen_processor  import _capture_camera, _capture_screen
 from actions.youtube_video     import youtube_video
 from actions.desktop           import desktop_control
-from actions.browser_control   import browser_control
 from actions.file_controller   import file_controller
-from actions.code_helper       import code_helper
-from actions.dev_agent         import dev_agent
 from actions.web_search        import web_search as web_search_action
 from actions.computer_control  import computer_control
 from actions.game_updater      import game_updater
@@ -130,12 +126,18 @@ class JarvisLive:
 
     def __init__(self, ui: JarvisUI):
         self.ui             = ui
-        self.logger         = JarvisLogger(BASE_DIR)
+        self.logger         = JarvisLogger(BASE_DIR,
+            retention_days=ORCHESTRATOR_CONFIG.diagnostics.retention_days,
+            queue_capacity=ORCHESTRATOR_CONFIG.diagnostics.queue_capacity,
+            max_file_bytes=ORCHESTRATOR_CONFIG.diagnostics.max_file_bytes)
+        install_logger(self.logger)
         self._active_trace_id: str | None = None
         self._model_capabilities_checked = False
-        self._coordination: CoordinationLifecycle | None = None
+        self._local_runtime: LocalRuntime | None = None
         self._execution_gateway: ExecutionGateway | None = None
-        self._tool_intake: LegacyToolIntake | None = None
+        self._tool_intake: LocalOrchestrator | None = None
+        self._desktop_workers = None
+        self._health_job = None
         self._asst_name     = "JARVIS"   # updated each session from config
         self.session              = None
         self.audio_in_queue       = None
@@ -161,6 +163,8 @@ class JarvisLive:
         self.ui.on_barge_in_changed = self._set_barge_in
         self.ui.on_open_debug_logs = self.logger.get_events
         self.ui.on_debug_log_sources = self.logger.get_sources
+        self.ui.on_orchestrator_snapshot = self._orchestrator_snapshot
+        self.ui.on_orchestrator_action = self._orchestrator_action
         self._turn_done_event: asyncio.Event | None = None
         self._dashboard     = None
         self._briefing_sent    = False          # morning briefing fires once per process
@@ -181,6 +185,157 @@ class JarvisLive:
         url    = self._dashboard.get_url()
         manual = self._dashboard.get_manual_url()
         return url, key, f"{url}/auto-login?key={key}", manual
+
+    def _orchestrator_snapshot(self):
+        if self._loop is None or not self._loop.is_running():
+            raise RuntimeError("Task center is not ready yet.")
+
+        async def snapshot():
+            from orchestrator_ui import build_task_snapshot
+            if self._tool_intake is None:
+                raise RuntimeError("Task center is not ready yet.")
+            tasks = build_task_snapshot(self._tool_intake)
+            if self._desktop_workers:
+                self._desktop_workers.enrich(tasks)
+            return tasks
+
+        return asyncio.run_coroutine_threadsafe(snapshot(), self._loop)
+
+    def _orchestrator_action(self, action, **values):
+        if self._loop is None or not self._loop.is_running():
+            raise RuntimeError("Task center is not ready yet.")
+        return asyncio.run_coroutine_threadsafe(
+            self._apply_orchestrator_action(action, values), self._loop
+        )
+
+    from orchestrator.model_health import bounded_model_call
+
+    @bounded_model_call
+    async def _generate_plan(self, **values):
+        # Create an API client only for a user-requested plan, not at startup.
+        async with genai.Client(api_key=_get_api_key()).aio as client:
+            class ClientView:
+                aio = client
+            return await GeminiPlanGenerator(ClientView())(**values)
+
+    async def _generate_worker(self, **values):
+        coding_image = values.pop('coding_image', None)
+        if coding_image is not None:
+            return await self._generate_coding_image(coding_image=coding_image, **values)
+        screenshot = values.pop("screenshot", None)
+        if screenshot is None:
+            return await self._generate_plan(**values)
+        return await self._generate_browser(screenshot=screenshot, **values)
+
+    @bounded_model_call
+    async def _generate_coding_image(self, *, coding_image, image_mime, **values):
+        async with genai.Client(api_key=_get_api_key()).aio as client:
+            response = await client.models.generate_content(model=values['model'],
+                contents=[types.Content(role='user', parts=[types.Part(text=values['prompt']),
+                    types.Part.from_bytes(data=coding_image, mime_type=image_mime)])],
+                config=types.GenerateContentConfig(system_instruction=values['instruction'],
+                    response_mime_type='application/json', response_json_schema=values['schema'],
+                    max_output_tokens=8192))
+        return response.text
+
+    @bounded_model_call
+    async def _generate_browser(self, *, screenshot, **values):
+        # The Computer Use model proposes one action; only our gateway executes it.
+        from orchestrator.computer_use import native_browser_proposal
+        custom_actions = [
+            types.FunctionDeclaration(name="browser_new_tab", description="Open an allowed HTTPS URL in a new isolated tab.",
+                parameters={"type": "OBJECT", "properties": {"url": {"type": "STRING"}}, "required": ["url"]}),
+            types.FunctionDeclaration(name="browser_select_tab", description="Select a tab using its zero-based index from browser metadata.",
+                parameters={"type": "OBJECT", "properties": {"tab_index": {"type": "INTEGER"}}, "required": ["tab_index"]}),
+            types.FunctionDeclaration(name="browser_close_tab", description="Close the current tab, keeping at least one tab open.",
+                parameters={"type": "OBJECT", "properties": {}}),
+            types.FunctionDeclaration(name="browser_reload", description="Reload the current allowed page.",
+                parameters={"type": "OBJECT", "properties": {}}),
+        ]
+        async with genai.Client(api_key=_get_api_key()).aio as client:
+            response = await client.models.generate_content(
+                model=values["model"],
+                contents=[types.Content(role="user", parts=[
+                    types.Part(text=values["prompt"]),
+                    types.Part.from_bytes(data=screenshot, mime_type="image/png"),
+                ])],
+                config=types.GenerateContentConfig(
+                    system_instruction=values["instruction"] + " For type_text_at always set press_enter=false and clear_before_typing=true. "
+                        "Never submit forms. Keyboard commands are limited to navigation and ordinary field editing; Enter is not allowed.",
+                    tools=[types.Tool(computer_use=types.ComputerUse(environment="ENVIRONMENT_BROWSER")),
+                           types.Tool(function_declarations=custom_actions)],
+                    max_output_tokens=2048,
+                ),
+            )
+        calls = response.function_calls or []
+        if not calls:
+            return json.dumps({"action": "done"})
+        call = calls[0]
+        return json.dumps(native_browser_proposal(call.name, dict(call.args or {})))
+
+    async def _apply_orchestrator_action(self, action, values):
+        engine = self._tool_intake
+        if engine is None:
+            raise RuntimeError("Task center is not ready yet.")
+        try:
+            if action == "load_checkpoint":
+                return self._desktop_workers.load_checkpoint(values["artifact_id"])
+            if action == "submit_coding":
+                return await self._desktop_workers.submit_coding(values["workspace"], values["text"],
+                    values.get('mode', 'edit'), values.get('image_path', ''))
+            if action == 'submit_commands':
+                return await self._desktop_workers.submit_commands(values['workspace'], values['commands'])
+            if action in {"coding_apply", "coding_restore"}:
+                return await self._desktop_workers.request_code_action(action, values["session_id"], values["diff_hash"])
+            if action == "submit_browser":
+                return await self._desktop_workers.start_browser(values["text"], values["url"], values["domains"], values.get('browser_name', 'chromium'))
+            if action == "stop_browser":
+                return await self._desktop_workers.stop_browser(values["session_id"])
+            if action == "stop_all":
+                engine.blocked_reason = "emergency_stop"
+                await engine.shutdown()
+                await self._desktop_workers.close()
+                return {"ok": True}
+            if action == "submit":
+                intent = Intent(
+                    intent_id=self.logger.new_trace_id(), session_id=self.logger.session_id,
+                    trace_id=self.logger.new_trace_id(), mode=TaskMode.ROUTINE,
+                    goal=str(values["text"]).strip(), received_at=datetime.now(timezone.utc),
+                )
+                return await engine.submit_intent(intent)
+            if action == "approve_plan":
+                await engine.approve_plan(values["task_id"], values["plan_version"])
+            elif action == "approve_step":
+                result = await engine.approve_step(values["approval_id"], allow_matching=values.get('allow_matching', False))
+                if self._desktop_workers and result is not None:
+                    self._desktop_workers.approval_resolved(values["approval_id"], result)
+            elif action == "deny_step":
+                record = engine.gateway.approvals.deny(
+                    values["approval_id"], channel="desktop_click", approver="local_user"
+                )
+                await engine.cancel(record.task_id)
+                if self._desktop_workers:
+                    self._desktop_workers.approval_denied(values["approval_id"])
+            elif action in {"pause", "cancel", "resume"}:
+                await getattr(engine, action)(values["task_id"])
+            else:
+                raise ValueError("Unknown task control.")
+            # Speak status only; never feed plan text, arguments or audit payloads
+            # back to the voice model as trusted instructions.
+            if self.session:
+                try:
+                    await self._send_text(
+                        f"Desktop task control '{action}' finished. Briefly tell the user "
+                        "to check Task Center for the current task status. Do not claim task success."
+                    )
+                except Exception:
+                    pass
+            return {"ok": True}
+        except Exception as exc:
+            self.logger.log("warn", "orchestrator", "task_control_failed",
+                            "Desktop task control could not complete.",
+                            result={"error_type": type(exc).__name__})
+            raise RuntimeError("Task control could not complete. Refresh the task to check its current state.") from None
 
     def _on_text_command(self, text: str):
         if not self._loop or not self.session:
@@ -245,7 +400,7 @@ class JarvisLive:
         """Complete interruption on the asyncio thread; asyncio.Queue is not thread-safe."""
         drained = _drain_async_queue(self.audio_in_queue)
         if drained:
-            print(f"[JARVIS] ✋ Interrupted — {drained} audio chunks discarded")
+            diagnostic(f"[JARVIS] ✋ Interrupted — {drained} audio chunks discarded")
         self.set_speaking(False)
         if self._turn_done_event:
             self._turn_done_event.clear()
@@ -367,7 +522,7 @@ class JarvisLive:
         )
         self.ui.write_log(f"ACTION: {name} started.")
 
-        print(f"[JARVIS] 🔧 {name}  {args}")
+        diagnostic(f"[JARVIS] 🔧 {name}  {args}")
         self.ui.set_state("THINKING")
 
         if name == "save_memory":
@@ -376,7 +531,7 @@ class JarvisLive:
             value    = args.get("value", "")
             if key and value:
                 update_memory({category: {key: {"value": value}}})
-                print(f"[Memory] 💾 save_memory: {category}/{key} = {value}")
+                diagnostic(f"[Memory] 💾 save_memory: {category}/{key} = {value}")
             self.logger.log(
                 "info", "memory", "tool_result", "Memory update completed.",
                 trace_id=trace_id, tool_name=name, arguments=args,
@@ -401,10 +556,6 @@ class JarvisLive:
                 r = await loop.run_in_executor(None, lambda: weather_action(parameters=args, player=self.ui))
                 result = r or "Weather delivered."
 
-            elif name == "browser_control":
-                r = await loop.run_in_executor(None, lambda: browser_control(parameters=args, player=self.ui))
-                result = r or "Done."
-
             elif name == "file_controller":
                 r = await loop.run_in_executor(None, lambda: file_controller(parameters=args, player=self.ui))
                 result = r or "Done."
@@ -427,7 +578,7 @@ class JarvisLive:
                 _cooldown = 4.0  # seconds — covers echo window after speaking ends
                 if self._vision_busy or (_now - self._vision_last_time) < _cooldown:
                     _wait = max(0, _cooldown - (_now - self._vision_last_time))
-                    print(f"[Vision] ⏳ Cooldown active ({_wait:.1f}s remaining) — ignoring duplicate call")
+                    diagnostic(f"[Vision] ⏳ Cooldown active ({_wait:.1f}s remaining) — ignoring duplicate call")
                     result = "Vision is still processing the previous request. I will not call this again."
                 else:
                     self._vision_busy      = True
@@ -438,11 +589,11 @@ class JarvisLive:
                         img_b, mime_t = await loop.run_in_executor(None, _capture_camera)
                         self.ui.start_camera_stream()
                         self._vision_cam_active = True
-                        print(f"[Vision] 📷 Camera: {len(img_b):,} bytes")
+                        diagnostic(f"[Vision] 📷 Camera: {len(img_b):,} bytes")
                         _stall = "camera"
                     else:
                         img_b, mime_t = await loop.run_in_executor(None, _capture_screen)
-                        print(f"[Vision] 🖥️  Screen: {len(img_b):,} bytes")
+                        diagnostic(f"[Vision] 🖥️  Screen: {len(img_b):,} bytes")
                         _stall = "screen"
                     self._pending_vision = (img_b, mime_t, user_text, angle)
                     result = (
@@ -462,14 +613,6 @@ class JarvisLive:
 
             elif name == "desktop_control":
                 r = await loop.run_in_executor(None, lambda: desktop_control(parameters=args, player=self.ui))
-                result = r or "Done."
-
-            elif name == "code_helper":
-                r = await loop.run_in_executor(None, lambda: code_helper(parameters=args, player=self.ui, speak=self.speak))
-                result = r or "Done."
-
-            elif name == "dev_agent":
-                r = await loop.run_in_executor(None, lambda: dev_agent(parameters=args, player=self.ui, speak=self.speak))
                 result = r or "Done."
 
             elif name == "web_search":
@@ -531,7 +674,7 @@ class JarvisLive:
                         except Exception:
                             pass
                     await asyncio.sleep(1.5)
-                    await self._stop_coordination()
+                    await self._stop_local_runtime()
                     import os as _os
                     _os._exit(0)
                 asyncio.create_task(_do_shutdown())
@@ -541,7 +684,7 @@ class JarvisLive:
 
         except Exception as e:
             result = f"Tool '{name}' failed: {e}"
-            traceback.print_exc()
+            diagnostic("Exception details withheld.")
             self.logger.log(
                 "error", "tool_router", "error", f"Tool failed: {name}.",
                 trace_id=trace_id, tool_name=name, arguments=args,
@@ -559,7 +702,7 @@ class JarvisLive:
             duration_ms=(time.monotonic() - started) * 1000,
         )
         self.ui.write_log(f"ACTION: {name} completed.")
-        print(f"[JARVIS] 📤 {name} → {str(result)[:80]}")
+        diagnostic(f"[JARVIS] 📤 {name} → {str(result)[:80]}")
         return types.FunctionResponse(
             id=fc.id, name=name,
             response={"result": result}
@@ -578,6 +721,12 @@ class JarvisLive:
             return handler
 
         adapters = {
+            "coding_prepare": CallableToolAdapter("coding_prepare", self._desktop_workers.prepare),
+            "coding_inspect": CallableToolAdapter("coding_inspect", self._desktop_workers.inspect_code),
+            "coding_command": CallableToolAdapter("coding_command", self._desktop_workers.run_command),
+            "coding_apply": CallableToolAdapter("coding_apply", self._desktop_workers.apply),
+            "coding_restore": CallableToolAdapter("coding_restore", self._desktop_workers.restore),
+            "browser_action": CallableToolAdapter("browser_action", self._desktop_workers.browser_action),
             "open_app": CallableToolAdapter(
                 "open_app",
                 action(
@@ -590,10 +739,6 @@ class JarvisLive:
             "weather_report": CallableToolAdapter(
                 "weather_report",
                 action(weather_action, "Weather delivered.", player=self.ui),
-            ),
-            "browser_control": CallableToolAdapter(
-                "browser_control",
-                action(browser_control, "Done.", player=self.ui),
             ),
             "file_controller": CallableToolAdapter(
                 "file_controller",
@@ -634,16 +779,6 @@ class JarvisLive:
             "desktop_control": CallableToolAdapter(
                 "desktop_control",
                 action(desktop_control, "Done.", player=self.ui),
-            ),
-            "code_helper": CallableToolAdapter(
-                "code_helper",
-                action(
-                    code_helper, "Done.", player=self.ui, speak=self.speak
-                ),
-            ),
-            "dev_agent": CallableToolAdapter(
-                "dev_agent",
-                action(dev_agent, "Done.", player=self.ui, speak=self.speak),
             ),
             "web_search": CallableToolAdapter(
                 "web_search", self._adapter_web_search
@@ -730,10 +865,13 @@ class JarvisLive:
             query = arguments.get("query") or ", ".join(arguments.get("items", []))
             label = f"{mode.upper()} — {query[:38]}" if query else mode.upper()
             self.ui.show_content(label, result)
-        return result
+        return {
+            "text": str(result), "sources": list(getattr(result, "sources", ())),
+            "retrieved_at": datetime.now(timezone.utc).isoformat(),
+        }
 
     async def _adapter_system_status(self, arguments):
-        return str(await asyncio.to_thread(get_system_status))
+        return await asyncio.to_thread(get_system_status)
 
     async def _adapter_manage_monitor(self, arguments):
         operation = arguments.get("action", "").lower().strip()
@@ -758,7 +896,7 @@ class JarvisLive:
                 except Exception:
                     pass
             await asyncio.sleep(1.5)
-            await self._stop_coordination()
+            await self._stop_local_runtime()
             import os as local_os
             local_os._exit(0)
 
@@ -767,6 +905,9 @@ class JarvisLive:
 
     async def _execute_tool(self, fc) -> types.FunctionResponse:
         name = fc.name
+        if name not in {declaration["name"] for declaration in TOOL_DECLARATIONS}:
+            return types.FunctionResponse(id=fc.id, name=name,
+                response={"result": "This action is available only through trusted desktop controls."})
         arguments = dict(fc.args or {})
         if name == "file_processor" and not arguments.get("file_path"):
             if self.ui.current_file:
@@ -796,6 +937,8 @@ class JarvisLive:
                 disposition = gateway_result.disposition.value
                 if gateway_result.disposition is GatewayDisposition.EXECUTED:
                     result = gateway_result.output or "Done."
+                    if name == "web_search" and isinstance(result, dict):
+                        result = result.get("text", "Search returned no text.")
                     self.ui.write_log(f"ACTION: {name} completed through safety gateway.")
                 elif gateway_result.disposition is GatewayDisposition.APPROVAL_REQUIRED:
                     result = (
@@ -813,12 +956,22 @@ class JarvisLive:
                         "without verification."
                     )
                 elif gateway_result.disposition is GatewayDisposition.FAILED:
-                    result = "The action failed safely; see Debug Logs."
+                    result = (
+                        "The action could not be verified. Check Tasks before trying again."
+                        if "verification_not_passed" in gateway_result.reason_codes
+                        else "The task could not complete. Check Tasks for its current state."
+                    )
+                elif "verifier_unavailable" in gateway_result.reason_codes:
+                    result = "This tool is not enabled yet because its result cannot be verified. No action was executed."
+                elif "isolated_worker_not_available" in gateway_result.reason_codes:
+                    result = "The coding or computer-use worker is not enabled yet. No action was executed."
+                elif "unresolved_desktop_effect" in gateway_result.reason_codes:
+                    result = "A previous desktop action still has an unknown outcome. Review it in Tasks before making another desktop change."
                 else:
                     result = "Safety policy denied this action; it was not executed."
             except Exception as exc:
                 disposition = "gateway_error"
-                result = "The safety gateway failed closed; the action was not executed."
+                result = "The task could not complete. Check Tasks before trying again; its outcome may need verification."
                 self.logger.log(
                     "error", "execution_gateway", "gateway_error",
                     "Tool gateway failed closed.",
@@ -891,13 +1044,13 @@ class JarvisLive:
                 try:
                     await self._send_audio_stream_end()
                 except Exception as exc:
-                    print(f"[JARVIS] Audio stream-end warning: {exc}")
+                    diagnostic(f"[JARVIS] Audio stream-end warning: {exc}")
                 paused_at = None
             was_streaming = streaming
             await asyncio.sleep(0.05)
 
     async def _listen_audio(self):
-        print("[JARVIS] 🎤 Mic started")
+        diagnostic("[JARVIS] 🎤 Mic started")
         loop = asyncio.get_event_loop()
 
         def callback(indata, frames, time_info, status):
@@ -916,15 +1069,15 @@ class JarvisLive:
                 latency="low",
                 callback=callback,
             ):
-                print("[JARVIS] 🎤 Mic stream open")
+                diagnostic("[JARVIS] 🎤 Mic stream open")
                 while True:
                     await asyncio.sleep(0.1)
         except Exception as e:
-            print(f"[JARVIS] ❌ Mic: {e}")
+            diagnostic(f"[JARVIS] ❌ Mic: {e}")
             raise
 
     async def _receive_audio(self):
-        print("[JARVIS] 👂 Recv started")
+        diagnostic("[JARVIS] 👂 Recv started")
         out_buf = ""
         in_buf  = ""
 
@@ -938,7 +1091,7 @@ class JarvisLive:
 
                     go_away = getattr(response, "go_away", None)
                     if go_away is not None:
-                        print(
+                        diagnostic(
                             "[JARVIS] Gemini connection rotation requested; "
                             f"time left: {go_away.time_left}"
                         )
@@ -951,7 +1104,7 @@ class JarvisLive:
                         self.set_speaking(False)
                         if self._turn_done_event:
                             self._turn_done_event.clear()
-                        print(
+                        diagnostic(
                             f"[JARVIS] Server interruption — {drained} "
                             "playback chunks discarded"
                         )
@@ -1054,7 +1207,7 @@ class JarvisLive:
                             if self._pending_vision and self.session:
                                 img_b, mime_t, question, angle = self._pending_vision
                                 self._pending_vision = None
-                                print(f"[Vision] 📤 {len(img_b):,} bytes (angle={angle}) → main session")
+                                diagnostic(f"[Vision] 📤 {len(img_b):,} bytes (angle={angle}) → main session")
                                 await self._send_video_prompt(
                                     img_b, mime_t, question
                                 )
@@ -1082,7 +1235,7 @@ class JarvisLive:
                                 "info", "tool_router", "tool_call", f"Model requested tool: {fc.name}.",
                                 trace_id=self._active_trace_id, tool_name=fc.name,
                             )
-                            print(f"[JARVIS] 📞 {fc.name}")
+                            diagnostic(f"[JARVIS] 📞 {fc.name}")
                             fr = await self._execute_tool(fc)
                             fn_responses.append(fr)
                         async with self._send_lock:
@@ -1090,12 +1243,12 @@ class JarvisLive:
                                 function_responses=fn_responses
                             )
         except Exception as e:
-            print(f"[JARVIS] ❌ Recv: {e}")
-            traceback.print_exc()
+            diagnostic(f"[JARVIS] ❌ Recv: {e}")
+            diagnostic("Exception details withheld.")
             raise
 
     async def _play_audio(self):
-        print("[JARVIS] 🔊 Play started")
+        diagnostic("[JARVIS] 🔊 Play started")
 
         stream = sd.RawOutputStream(
             samplerate=RECEIVE_SAMPLE_RATE,
@@ -1139,7 +1292,7 @@ class JarvisLive:
                 except (RuntimeError, asyncio.CancelledError):
                     break   # executor shutting down — exit cleanly
         except Exception as e:
-            print(f"[JARVIS] ❌ Play: {e}")
+            diagnostic(f"[JARVIS] ❌ Play: {e}")
             raise
         finally:
             self.set_speaking(False)
@@ -1256,7 +1409,7 @@ class JarvisLive:
                 await self._send_text(p2)
                 self.ui.write_log("SYS: Briefing phase 2 (news) sent.")
             except Exception as e:
-                print(f"[Briefing] Phase 2 error: {e}")
+                diagnostic(f"[Briefing] Phase 2 error: {e}")
                 self.ui.write_log(f"SYS: Briefing phase 2 failed: {e}")
 
         asyncio.create_task(_deliver_news())
@@ -1294,7 +1447,7 @@ class JarvisLive:
                 save_session_summary(summary, lang)
                 self.logger.log("info", "memory", "system", "Session summary saved.")
         except Exception as e:
-            print(f"[Memory] ⚠️ Session summary failed: {e}")
+            diagnostic(f"[Memory] ⚠️ Session summary failed: {e}")
 
     # ── System monitor ──────────────────────────────────────────────────────────
 
@@ -1314,7 +1467,7 @@ class JarvisLive:
             try:
                 await self._send_text(alert)
             except Exception as e:
-                print(f"[Monitor] ⚠️ Could not send alert: {e}")
+                diagnostic(f"[Monitor] ⚠️ Could not send alert: {e}")
 
     # ── Background monitor ──────────────────────────────────────────────────────
 
@@ -1344,7 +1497,7 @@ class JarvisLive:
                             self.ui.write_log(f"SYS: Monitor alert sent.")
                             await asyncio.sleep(6)   # gap between consecutive alerts
                     except Exception as e:
-                        print(f"[Monitor] ⚠️ Background check error: {e}")
+                        diagnostic(f"[Monitor] ⚠️ Background check error: {e}")
             await asyncio.sleep(1800)     # check every 30 minutes
 
     # ── Proactive mode ──────────────────────────────────────────────────────────
@@ -1384,7 +1537,7 @@ class JarvisLive:
                 await self._send_text(prompt)
                 self.ui.write_log("SYS: Proactive check-in.")
             except Exception as e:
-                print(f"[Proactive] ⚠️ {e}")
+                diagnostic(f"[Proactive] ⚠️ {e}")
 
     # ── Phone audio relay ────────────────────────────────────────────────────────
 
@@ -1425,103 +1578,105 @@ class JarvisLive:
                     await self._send_text(text)
                     self.ui.write_log(f"[Web]: {text}")
                 else:
-                    print(f"[Dashboard] Dropped command (no session): {text}")
+                    diagnostic(f"[Dashboard] Dropped command (no session): {text}")
             except asyncio.TimeoutError:
                 pass
             except Exception as e:
-                print(f"[Dashboard] Command error: {e}")
+                diagnostic(f"[Dashboard] Command error: {e}")
                 await asyncio.sleep(0.5)
 
     # ── main loop ───────────────────────────────────────────────────────────
 
-    def _report_coordination_health(self, health: CoordinationHealth) -> None:
-        result = {
-            "mode": health.mode.value,
-            "redis_available": health.redis_available,
-            "circuit_state": health.circuit_state.value,
-            "consecutive_failures": health.consecutive_failures,
-            "reason_code": health.reason_code,
-        }
-        if health.mode is CoordinationMode.REDIS:
-            self.logger.log(
-                "info", "coordination", "coordination_health",
-                "Redis coordination connected.", result=result,
-            )
-            self.ui.write_log("SYS: Redis coordination connected.")
-            return
-
-        reason = health.reason_code or "redis_unavailable"
-        self.logger.log(
-            "warn", "coordination", "coordination_health",
-            "Redis coordination unavailable; SQLite degraded mode active.",
-            result=result,
-        )
-        self.ui.write_log(
-            f"WARN: Redis unavailable ({reason}); SQLite degraded mode active."
-        )
-
-    def _report_coordination_error(self, exc: Exception) -> None:
-        self.logger.log(
-            "error", "coordination", "coordination_monitor_error",
-            "Coordination health monitor failed unexpectedly.",
-            result={"error_type": type(exc).__name__},
-        )
-
-    async def _start_coordination(self) -> None:
+    async def _start_local_runtime(self) -> None:
+        runtime = create_local_runtime(BASE_DIR, ORCHESTRATOR_CONFIG)
         try:
-            self._coordination = create_application_coordination(
-                BASE_DIR,
-                ORCHESTRATOR_CONFIG,
-                on_health=self._report_coordination_health,
-                on_error=self._report_coordination_error,
+            await runtime.start()
+            from orchestrator.desktop_workers import DesktopWorkers
+            self._desktop_workers = DesktopWorkers(runtime.store, self._generate_worker, ORCHESTRATOR_CONFIG, self.logger.session_id)
+            gateway = ExecutionGateway(
+                runtime.store, self._build_tool_adapters(), ORCHESTRATOR_CONFIG
             )
-            await self._coordination.start()
-            adapters = self._build_tool_adapters()
-            self._execution_gateway = ExecutionGateway(
-                self._coordination.runtime.store,
-                adapters,
-                ORCHESTRATOR_CONFIG,
+            from orchestrator.runtime_verification import build_runtime_verifier
+            engine = LocalOrchestrator(
+                runtime.store, gateway,
+                planner=StructuredPlanner(self._generate_plan, ORCHESTRATOR_CONFIG.models.planner.name),
+                verifier=build_runtime_verifier(self),
             )
-            self._tool_intake = LegacyToolIntake(
-                self._coordination.runtime.store,
-                self._execution_gateway,
-            )
-        except Exception as exc:
+            await engine.recover()
+            self._desktop_workers.engine = engine
+            from orchestrator.worker_tools import INTERNAL_TOOL_NAMES
+            for tool in INTERNAL_TOOL_NAMES:
+                engine.verifier.register(tool, self._desktop_workers.verify)
+            supported = frozenset(engine.verifier._verifiers)
+            stage = ORCHESTRATOR_CONFIG.rollout.stage
+            if stage == "read_only":
+                supported &= {"system_status", "web_search"}
+            elif stage == "reversible":
+                supported -= INTERNAL_TOOL_NAMES
+            elif stage == "coding":
+                supported -= {"browser_action"}
+            engine.enabled_tools = supported
+            if ORCHESTRATOR_CONFIG.rollout.kill_switch:
+                engine.blocked_reason = "emergency_stop"
+            self._tool_intake = engine
+            self._execution_gateway = gateway
+            self._local_runtime = runtime
+            self._health_job = asyncio.create_task(self._watch_orchestrator_health())
             self.logger.log(
-                "error", "coordination", "coordination_startup_failed",
-                "Coordination startup failed.",
-                result={"error_type": type(exc).__name__},
+                "info", "orchestrator", "local_runtime_started",
+                "Local SQLite orchestration ready.",
             )
-            self.ui.write_log("ERR: Coordination startup failed; check Debug Logs.")
+            self.ui.write_log("SYS: Local SQLite orchestration ready.")
+        except Exception:
+            await runtime.stop()
             raise
 
-    async def _stop_coordination(self) -> None:
+    async def _stop_local_runtime(self) -> None:
+        health_job = getattr(self, "_health_job", None)
+        if health_job:
+            health_job.cancel()
+            await asyncio.gather(health_job, return_exceptions=True)
+        workers = getattr(self, "_desktop_workers", None)
+        engine = self._tool_intake
         self._tool_intake = None
+        if engine is not None:
+            await engine.shutdown()
+        if workers:
+            await workers.close()
         self._execution_gateway = None
-        lifecycle = self._coordination
-        self._coordination = None
-        if lifecycle is None:
-            return
-        try:
-            await lifecycle.stop()
-            self.logger.log(
-                "info", "coordination", "coordination_stopped",
-                "Redis coordination stopped cleanly.",
-            )
-        except Exception as exc:
-            self.logger.log(
-                "warn", "coordination", "coordination_shutdown_failed",
-                "Redis coordination shutdown reported an error.",
-                result={"error_type": type(exc).__name__},
-            )
+        runtime = self._local_runtime
+        self._local_runtime = None
+        if runtime is not None:
+            await runtime.stop()
+
+    async def _watch_orchestrator_health(self):
+        warned = False
+        while True:
+            await asyncio.sleep(ORCHESTRATOR_CONFIG.rollout.audit_interval_seconds)
+            engine = self._tool_intake
+            if engine is None:
+                return
+            try:
+                await asyncio.to_thread(engine.store.verify_audit_chain)
+            except Exception:
+                engine.blocked_reason = "audit_integrity_failed"
+                self.ui.write_log("ERR: Audit integrity check failed. Task execution is stopped.")
+                for task in engine.tasks():
+                    await engine.cancel(task["task_id"])
+                return
+            health = self.logger.health()
+            if health["degraded"] and not warned:
+                self.ui.write_log("WARN: Diagnostic logging is degraded. Some debug events were lost.")
+                warned = True
 
     async def run(self):
+        self._application_task = asyncio.current_task()
         self._loop = asyncio.get_event_loop()
         try:
-            await self._start_coordination()
+            await self._start_local_runtime()
             await self._run_application()
         finally:
-            await self._stop_coordination()
+            await self._stop_local_runtime()
 
     async def _run_application(self):
         self._loop = asyncio.get_event_loop()
@@ -1536,12 +1691,12 @@ class JarvisLive:
             # Runs for the whole lifetime, not just inside an active session
             asyncio.create_task(self._process_dashboard_commands())
         except Exception as e:
-            print(f"[Dashboard] Disabled: {e}")
+            diagnostic(f"[Dashboard] Disabled: {e}")
             self._dashboard = None
 
         while True:
             try:
-                print("[JARVIS] Connecting...")
+                diagnostic("[JARVIS] Connecting...")
                 self.ui.set_state("THINKING")
                 config = self._build_config()
 
@@ -1621,7 +1776,7 @@ class JarvisLive:
                     self._interrupted          = False
                     self._audio_stream_ended   = False
 
-                    print("[JARVIS] Connected.")
+                    diagnostic("[JARVIS] Connected.")
                     self._conn_backoff = 3
                     self.logger.log("info", "system", "system", "Live session connected.")
                     self.ui.set_state("LISTENING")
@@ -1650,6 +1805,8 @@ class JarvisLive:
                 raise
             except SystemExit:
                 raise
+            except asyncio.CancelledError:
+                raise
             except BaseException as e:
                 # Catches both Exception and BaseExceptionGroup (Python 3.11+
                 # TaskGroup raises BaseExceptionGroup when tasks are cancelled
@@ -1657,8 +1814,8 @@ class JarvisLive:
                 # exception escape the while-loop and causing asyncio.run() to
                 # start shutdown — resulting in "executor after shutdown" errors).
                 err_str = str(e)
-                print(f"[JARVIS] Error ({type(e).__name__}): {e}")
-                traceback.print_exc()
+                diagnostic(f"[JARVIS] Error ({type(e).__name__}): {e}")
+                diagnostic("Exception details withheld.")
                 self.logger.log(
                     "error", "system", "error", "Live session error.", exception=e,
                 )
@@ -1680,7 +1837,7 @@ class JarvisLive:
                     self.ui.prompt_reconfig()
                     while not self.ui._win._ready:
                         await asyncio.sleep(1)
-                    print("[JARVIS] New API key saved — reconnecting...")
+                    diagnostic("[JARVIS] New API key saved — reconnecting...")
                     _conn_backoff = 3
                     continue
 
@@ -1712,24 +1869,40 @@ class JarvisLive:
                 await self._dashboard.broadcast({"type": "status", "state": "sleeping"})
 
             delay = getattr(self, "_conn_backoff", 3)
-            print(f"[JARVIS] Reconnecting in {delay}s...")
+            diagnostic(f"[JARVIS] Reconnecting in {delay}s...")
             await asyncio.sleep(delay)
 
 def main():
     ui = JarvisUI("face.png")
+    running = {}
 
     def runner():
         ui.wait_for_api_key()
         jarvis = JarvisLive(ui)
+        running["jarvis"] = jarvis
         try:
             asyncio.run(jarvis.run())
-        except KeyboardInterrupt:
-            print("\n🔴 Shutting down...")
+        except (KeyboardInterrupt, asyncio.CancelledError):
+            diagnostic("\n🔴 Shutting down...")
         finally:
             jarvis.logger.close()
 
     threading.Thread(target=runner, daemon=True).start()
-    ui.root.mainloop()
+    try:
+        ui.root.mainloop()
+    finally:
+        jarvis = running.get("jarvis")
+        if jarvis and jarvis._loop and jarvis._loop.is_running():
+            async def finish():
+                task = getattr(jarvis, "_application_task", None)
+                if task:
+                    task.cancel()
+                    await asyncio.gather(task, return_exceptions=True)
+            try:
+                asyncio.run_coroutine_threadsafe(finish(), jarvis._loop).result(timeout=8)
+            except Exception:
+                jarvis.logger.emergency_flush()
+            jarvis.logger.close()
 
 if __name__ == "__main__":
     main()
