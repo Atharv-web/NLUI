@@ -1,3 +1,4 @@
+from core.diagnostics import diagnostic
 import json
 import sys
 from pathlib import Path
@@ -40,7 +41,7 @@ def load_api_keys() -> dict:
     try:
         return json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
     except Exception as e:
-        print(f"❌ Failed to load api_keys.json: {e}")
+        diagnostic(f"❌ Failed to load api_keys.json: {e}")
         return {}
 
 def get_gemini_key() -> str | None:

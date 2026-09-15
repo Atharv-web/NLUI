@@ -1,3 +1,4 @@
+from core.diagnostics import diagnostic
 import json
 from datetime import datetime
 from threading import Lock
@@ -41,7 +42,7 @@ def load_memory() -> dict:
                 return data
             return _empty_memory()
         except Exception as e:
-            print(f"[Memory] ⚠️ Load error: {e}")
+            diagnostic(f"[Memory] ⚠️ Load error: {e}")
             return _empty_memory()
 
 def _all_entries(memory: dict) -> list[tuple]:
@@ -64,7 +65,7 @@ def _trim_to_limit(memory: dict) -> dict:
         if len(json.dumps(memory, ensure_ascii=False)) <= MEMORY_MAX_CHARS:
             break
         del memory[cat][key]
-        print(f"[Memory] 🗑️  Trimmed {cat}/{key}")
+        diagnostic(f"[Memory] 🗑️  Trimmed {cat}/{key}")
     return memory
 
 def save_memory(memory: dict) -> None:
@@ -114,7 +115,7 @@ def update_memory(memory_update: dict) -> dict:
     memory = load_memory()
     if _recursive_update(memory, memory_update):
         save_memory(memory)
-        print(f"[Memory] 💾 Saved: {list(memory_update.keys())}")
+        diagnostic(f"[Memory] 💾 Saved: {list(memory_update.keys())}")
     return memory
 
 def format_memory_for_prompt(memory: dict | None) -> str:
@@ -243,7 +244,7 @@ def save_session_summary(summary: str, language: str = "") -> None:
             json.dumps(memory, indent=2, ensure_ascii=False),
             encoding="utf-8",
         )
-    print(f"[Memory] 📝 Session saved ({entry['date']}): {summary[:60]}…")
+    diagnostic(f"[Memory] 📝 Session saved ({entry['date']}): {summary[:60]}…")
 
 
 def pop_last_session() -> dict | None:
@@ -267,5 +268,5 @@ def pop_last_session() -> dict | None:
             )
             return entry
         except Exception as e:
-            print(f"[Memory] ⚠️ pop_last_session error: {e}")
+            diagnostic(f"[Memory] ⚠️ pop_last_session error: {e}")
             return None
